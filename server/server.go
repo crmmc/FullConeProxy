@@ -11,54 +11,122 @@ import (
 )
 
 var mybufsize int = 1024 * 8
-var tcpreadtimeout int = 60  //TCP Read Timeout 不要小于UDP Timeout
-var tcpwritetimeout int = 15 //TCP Write Timeout 一般不是太小就行
-var udplivetime int = 600    //每个UDP通道保持的时间
-var isdebug bool = false
 
-func SetDebug(mode bool) {
-	isdebug = mode
+//一个Server
+type AServer struct {
+	listener        net.Listener //私有，AServer的监听
+	keybyte         []byte       //私有，储存秘钥数据
+	tcpReadTimeout  int          //TCP Read Timeout
+	tcpWriteTimeout int          //TCP Write Timeout
+	udpLifeTime     int          //UDP的ReadWrite Timeout
+	tcpNODELAY      bool         //TCP的无延迟发送选项
+	Isdebug         bool         //是否处于调试模式
 }
 
-func SetTCPTimeout(st int) {
-	tcpreadtimeout = st
+func (r *AServer) Init() {
+	r.listener = nil
+	r.keybyte = nil
+	r.tcpReadTimeout = 60
+	r.tcpWriteTimeout = 15
+	r.udpLifeTime = 600
+	r.tcpNODELAY = true
+	r.Isdebug = false
 }
 
-func SetUDPTimeout(st int) {
-	udplivetime = st
+func (r *AServer) SetDebug(id bool) {
+	r.Isdebug = id
+}
+func (r *AServer) SetTCPReadTimeout(timeout int) {
+	r.tcpReadTimeout = timeout
+}
+func (r *AServer) SetTCPWriteTimeout(timeout int) {
+	r.tcpWriteTimeout = timeout
+}
+func (r *AServer) SetUDPLifeTime(timeout int) {
+	r.udpLifeTime = timeout
 }
 
-func Server(locallisten string, key []byte) {
-	defer log.Panic("Server Exit....")
-	fmt.Println("启动SERVER,监听地址为", locallisten)
+func (r *AServer) StartServer(locallisten string, key []byte) error {
+	fmt.Println("启动SERVER,监听地址为 ->", locallisten)
 	sl, err := net.Listen("tcp", locallisten)
 	if err != nil {
-		log.Println("SERVER监听错误，", locallisten, " , ", err.Error())
-		return
+		log.Println("SERVER监听错误 ->", locallisten, " , ", err.Error())
+		return err
 	}
-	defer sl.Close()
-	for {
-		sconn, err := sl.Accept()
-		if err != nil {
-			log.Println("SERVER 接受连接时出现错误! , ", err.Error())
-			break
-		}
+	r.listener = sl
+	r.keybyte = key
+	fmt.Printf("SERVER使用秘钥: |%x|\n", r.keybyte)
+	return nil
+}
 
-		sconn.(*net.TCPConn).SetLinger(0)
-		sconn.(*net.TCPConn).SetNoDelay(true)
-		sconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(tcpwritetimeout)))
-		sconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(tcpreadtimeout)))
-		go process(sconn, key)
+func (r *AServer) Close() {
+	if r.listener != nil {
+		r.listener.Close()
 	}
-	sl.Close()
+}
+
+//分开来的原因，是有时候需要创建大量服务器之后再开始监听，分步做应该会快点？
+func (r *AServer) StartLoop() error {
+	defer r.Close()
+	for {
+		sconn, err := r.listener.Accept()
+		if err != nil {
+			log.Printf("SERVER %s 在接受连接时出现错误! %s\n", r.listener.Addr().String(), err.Error())
+			return err
+		}
+		sconn.(*net.TCPConn).SetLinger(0)
+		sconn.(*net.TCPConn).SetNoDelay(r.tcpNODELAY)
+		sconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
+		sconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
+		var pc1 processer
+		//此处的变量一直不会改变值，所以传递指针
+		pc1.Isdebug = &r.Isdebug
+		pc1.TcpReadTimeout = &r.tcpReadTimeout
+		pc1.TcpWriteTimeout = &r.tcpWriteTimeout
+		pc1.UdpLifeTime = &r.udpLifeTime
+		//服务器连接到目标这一段网络的质量通常认为是很好的，所以不需要开启这个选项
+		pc1.TcpNODELAY = &r.tcpNODELAY
+		go pc1.Process(sconn, r.keybyte)
+	}
+}
+
+type processer struct {
+	connfromclient  *net.TCPConn
+	tcptotarget     *net.TCPConn
+	udptotarget     *net.UDPConn
+	keybyte         *[]byte
+	nonce           []byte
+	Isdebug         *bool
+	TcpReadTimeout  *int  //TCP Read Timeout
+	TcpWriteTimeout *int  //TCP Write Timeout
+	UdpLifeTime     *int  //UDP的ReadWrite Timeout
+	TcpNODELAY      *bool //TCP的无延迟发送选项
+
+}
+
+func (r *processer) Close() {
+	if r.connfromclient != nil {
+		r.connfromclient.Close()
+	}
+	if r.tcptotarget != nil {
+		r.tcptotarget.Close()
+	}
+	if r.udptotarget != nil {
+		r.udptotarget.Close()
+	}
 }
 
 //命令处理
-func process(sconn net.Conn, key []byte) bool {
-	defer sconn.Close()
+func (r *processer) Process(sconn net.Conn, key []byte) bool {
+	defer r.Close()
+	//此进程一般不会退出除非处理完成，所以传递指针
+	r.connfromclient = sconn.(*net.TCPConn)
+	r.keybyte = &key
+	//生成现在的时间戳，解密首包
 	timeStamp := time.Now().Unix()
 	timeLayout := "2006-01-02 15:04"
 	timeStr := time.Unix(timeStamp, 0).Format(timeLayout)
+	//首包的附加消息
 	var adddata []byte
 	var err error
 	adddata, err = mycrypto.Strtokey128(timeStr)
@@ -66,16 +134,19 @@ func process(sconn net.Conn, key []byte) bool {
 		log.Println("SERVER 生成首包时间戳失败! ,", err.Error())
 		return false
 	}
-	dedata, err := mycrypto.DecryptFrom(sconn, key, adddata)
+	//解密出来的完整首包数据
+	var dedata []byte
+	dedata, err = mycrypto.DecryptFrom(sconn, key, adddata)
 	if err != nil {
-		if isdebug {
+		if *r.Isdebug {
 			log.Println("SERVER: 解密指令包失败 , ", err.Error())
 		}
 		return false
 	}
+	//首包数据长度
 	n := len(dedata)
 	if err != nil || n < 21 {
-		if isdebug {
+		if *r.Isdebug {
 			log.Println("SERVER 指令包过短, ", n)
 		}
 		return false
@@ -94,58 +165,60 @@ func process(sconn net.Conn, key []byte) bool {
 	**/
 
 	//分离出的随机数
-	nownonce := dedata[0:16]
-	if isdebug {
-		fmt.Printf("SERVER 收到随机数 nonce: %x\n", nownonce)
+	r.nonce = dedata[0:16]
+	if *r.Isdebug {
+		fmt.Printf("SERVER 收到随机数 nonce: %x\n", r.nonce)
 	}
 	// TCP Method X'01'
 	// UDP Method X'03'
-
-	cmode := dedata[16] //CONTROL CODE
-	if cmode == 0x01 {
+	if dedata[16] == 0x01 {
 		//解析得到的目标地址
 		dstAddr := pubpro.BytesToTcpAddr(dedata[17:n])
-		if isdebug {
+		if *r.Isdebug {
 			fmt.Println("SERVER: 发起TCP连接 -> ", dstAddr.String())
 		}
-		return procrsstcp(sconn, dstAddr, key, nownonce)
+		//这一进程不会退出，所以发送过去数据指针
+		return r.procrsstcp(&dstAddr)
 	} else {
-		return processudp(sconn, key, nownonce)
+		return r.processudp()
 	}
 
 }
 
-func procrsstcp(sconn net.Conn, raddr net.TCPAddr, key []byte, nownonce []byte) bool {
-	rconn, err2 := net.DialTCP("tcp", nil, &raddr)
+func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
+	defer r.Close()
+	var err2 error
+	r.tcptotarget, err2 = net.DialTCP("tcp", nil, raddr)
 	if err2 != nil {
 		log.Println("SERVER: 发起TCP连接请求失败 , ", err2.Error())
 		return false
 	}
-	defer rconn.Close()
 	//设置服务器连接到目的地的连接的属性
-	rconn.SetLinger(0)
-	//这是服务器往目标主机之间的连接,通常认为这一段的网络质量是很好的
-	//rconn.SetNoDelay(true)
-	rconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(tcpreadtimeout)))
-	rconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(tcpwritetimeout)))
+	r.tcptotarget.SetLinger(0)
+	r.tcptotarget.SetNoDelay(*r.TcpNODELAY)
+	r.tcptotarget.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpReadTimeout)))
+	r.tcptotarget.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpWriteTimeout)))
 	// 从LOCAL读然后发送到TARGET
 	servertotarget := make(chan int, 1)
 	go func() {
-		defer sconn.Close()
-		defer rconn.Close()
+		defer r.Close()
 		var rcdata int
+		//往目标写入的数据的大小
 		var n int
+		//从客户端读到的TCP数据
+		var dedata []byte
+		var err error
 		for {
-			dedata, err := mycrypto.DecryptFrom(sconn, key, nownonce)
+			dedata, err = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce)
 			if err != nil {
-				if isdebug {
+				if *r.Isdebug {
 					log.Println("SERVER: 从LOCAL读数据错误！, ", err.Error())
 				}
 				break
 			}
-			n, err = rconn.Write(dedata)
+			n, err = r.tcptotarget.Write(dedata)
 			if err != nil {
-				if isdebug {
+				if *r.Isdebug {
 					log.Println("服务端: TCP转发来自LOCAL的数据错误！ , ", err.Error())
 				}
 				break
@@ -156,54 +229,57 @@ func procrsstcp(sconn net.Conn, raddr net.TCPAddr, key []byte, nownonce []byte) 
 	}()
 	//从TARGET读返回到LOCAL
 	targettoserver := 0
+	//从Target读到的数据
 	buf := make([]byte, mybufsize)
+	//从Target读到的数据大小
 	var ln int
 	var err error
 	for {
-		if ln, err = rconn.Read(buf); err != nil {
-			if isdebug {
+		if ln, err = r.tcptotarget.Read(buf); err != nil {
+			if *r.Isdebug {
 				log.Println("SERVER 从TARGET读数据错误！, ", err.Error())
 			}
 			break
 		} else {
 			targettoserver = targettoserver + ln
-			_, err = mycrypto.EncryptTo(buf[:ln], sconn, key, nownonce)
+			_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce)
 			if err != nil {
 				break
 			}
 		}
 	}
-	sconn.Close()
-	fmt.Println("SERVER TCP CONNECTION ", rconn.RemoteAddr().String(), "  SEND:", pubpro.ReadableBytes(<-servertotarget), "   RECV:", pubpro.ReadableBytes(targettoserver))
+	//防止后面close后这个变量消失，这里新建一个变量存着Target的地址数据
+	TCPTOaddr := r.tcptotarget.RemoteAddr().String()
+	r.Close()
+	fmt.Println("SERVER TCP CONNECTION ", TCPTOaddr, "  SEND:", pubpro.ReadableBytes(<-servertotarget), "   RECV:", pubpro.ReadableBytes(targettoserver))
 	return true
 }
 
-func processudp(sconn net.Conn, key []byte, nownonce []byte) bool {
-	defer sconn.Close()
+func (r *processer) processudp() bool {
+	defer r.Close()
 
 	var err1 error
-	//本地监听的UDP连接
-	var udpconn *net.UDPConn
 	//laddr为nil时,监听所有地址和随机选择可用端口
-	udpconn, err1 = net.ListenUDP("udp", nil)
+	r.udptotarget, err1 = net.ListenUDP("udp", nil)
 	if err1 != nil {
 		log.Println("SERVER UDP端口监听启动失败！ , ", err1.Error())
 		return false
 	}
 	//设置UDP连接的最大保持时间
-	udpconn.SetDeadline(time.Now().Add(time.Duration(udplivetime) * time.Second))
+	r.udptotarget.SetDeadline(time.Now().Add(time.Second * time.Duration(*r.UdpLifeTime)))
 	//延长SERVER到LOCAL连接的保持时间，这个时间必须不小于UDP连接的存活时间
-	sconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(udplivetime)))
-	if isdebug {
-		fmt.Println("SERVER 开放UDP端口 -> ", udpconn.LocalAddr().String())
+	r.connfromclient.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.UdpLifeTime)))
+	if *r.Isdebug {
+		fmt.Println("SERVER 开放UDP端口 -> ", r.udptotarget.LocalAddr().String())
 	}
 
 	//目标返回到服务器UDP端口的数据总大小
 	targettoserverudp := make(chan int, 1)
 	go func() {
-		defer sconn.Close()
-		defer udpconn.Close()
+		defer r.Close()
+		//临时收到的数据总大小
 		var tmprecv int
+		//现在这个包的数据大小
 		var rcn int
 		var err2 error
 		//储存收到的UDP包的来源地址
@@ -212,9 +288,9 @@ func processudp(sconn net.Conn, key []byte, nownonce []byte) bool {
 		var writebuf []byte
 		buf := make([]byte, mybufsize)
 		for {
-			rcn, saddr, err2 = udpconn.ReadFromUDP(buf)
+			rcn, saddr, err2 = r.udptotarget.ReadFromUDP(buf)
 			if err2 != nil {
-				if isdebug {
+				if *r.Isdebug {
 					log.Println("SERVER UDP从目标服务器读数据错误！ , ", err2.Error())
 				}
 				break
@@ -226,11 +302,11 @@ func processudp(sconn net.Conn, key []byte, nownonce []byte) bool {
 
 			//把地址转换成bytes
 			writebuf = pubpro.AddrToBytes(saddr.IP, saddr.Port)
-			if isdebug {
+			if *r.Isdebug {
 				fmt.Printf("SERVER 送回UDP数据包: |%x|%x| , %s <- %s\n", writebuf, buf[:rcn], pubpro.ReadableBytes(rcn), saddr.String())
 			}
 			//通过命令连接送回UDP数据包
-			_, err2 := mycrypto.EncryptTo(pubpro.ConnectBytes(writebuf, buf[:rcn]), sconn, key, nownonce)
+			_, err2 := mycrypto.EncryptTo(pubpro.ConnectBytes(writebuf, buf[:rcn]), r.connfromclient, *r.keybyte, r.nonce)
 			if err2 != nil {
 				log.Println("SERVER 转发已接收到的UDP数据错误！ , ", err2.Error())
 				break
@@ -242,17 +318,19 @@ func processudp(sconn net.Conn, key []byte, nownonce []byte) bool {
 	var fromlocaldata []byte
 	//要发往目标的数据
 	var realdata []byte
+	//从LOCAL收到的总数据大小含包头
 	var n int
+	//SERVER发往Target的总数据包大小
 	var servertotargetudp int
 	for {
-		fromlocaldata, err1 = mycrypto.DecryptFrom(sconn, key, nownonce)
+		fromlocaldata, err1 = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce)
 		if err1 != nil {
-			if isdebug {
+			if *r.Isdebug {
 				log.Println("SERVER UoT隧道读数据失败 , ", err1.Error())
 			}
 			break
 		}
-		if isdebug {
+		if *r.Isdebug {
 			fmt.Printf("SERVER 来自LOCAL的UDP数据包 |%x|\n", fromlocaldata)
 		}
 		//因为UDP数据包带载荷，所以导致我得自己分离出地址，因为必须现场知道长度才能分离出数据
@@ -274,33 +352,33 @@ func processudp(sconn net.Conn, key []byte, nownonce []byte) bool {
 			realdata = fromlocaldata[2+int(fromlocaldata[1])+2:]
 			targetaddr, err1 = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", (fromlocaldata[2:2+int(fromlocaldata[1])]), pubpro.BytesTouInt16(fromlocaldata[2+int(fromlocaldata[1]):2+int(fromlocaldata[1])+2])))
 			if err1 != nil {
-				if isdebug {
+				if *r.Isdebug {
 					log.Println("SERVER 处理UDP数据时发生错误: 解析目标网址失败! , ", err1.Error())
 				}
 			}
 		default:
-			if isdebug {
+			if *r.Isdebug {
 				log.Println("SERVER 处理UDP数据时发生错误: 地址类型无法识别! , ", err1.Error())
 			}
 		}
 		if err1 != nil {
-			if isdebug {
+			if *r.Isdebug {
 				log.Printf("此UoT包因错误而被忽略 |%x| ,%s \n", fromlocaldata[:n], err1.Error())
 			}
 			continue //跳过这个包
 		}
-		n, err1 = udpconn.WriteToUDP(realdata, targetaddr)
+		n, err1 = r.udptotarget.WriteToUDP(realdata, targetaddr)
 		if err1 != nil {
 			log.Println("SERVER 发送UDP数据到目的地失败！ ， ", err1.Error())
 			break
 		}
-		if isdebug {
+		if *r.Isdebug {
 			fmt.Printf("SERVER 转发来自LOCAL的UDP数据 |%x| , %s -> %s\n", realdata, pubpro.ReadableBytes(n), targetaddr.String())
 		}
 		servertotargetudp = servertotargetudp + n
 
 	}
-	udpconn.Close()
+	r.Close()
 	fmt.Println("UDP 方式 : SEND ", pubpro.ReadableBytes(servertotargetudp), " RECV", pubpro.ReadableBytes(<-targettoserverudp))
 	return true
 }
