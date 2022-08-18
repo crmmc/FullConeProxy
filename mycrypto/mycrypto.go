@@ -1,7 +1,6 @@
 package mycrypto
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -11,22 +10,16 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"runtime"
 	"time"
 
 	"../pubpro"
-	gzip "github.com/klauspost/pgzip"
 )
 
 var isdebug bool = true
-var isongzip bool = false
 var maxallowtimeerror int64 = 10 //最大允许收发数据包的两端时间相差10秒
 
 func SetDebug(mode bool) {
 	isdebug = mode
-}
-func SetGzip(mode bool) {
-	isongzip = mode
 }
 
 func Strtokey128(str string) ([]byte, error) {
@@ -94,12 +87,6 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte) (int, er
 
 //AES GCM加密
 func EncodeAesGCM(data []byte, key []byte, adddata []byte) ([]byte, error) {
-	if isongzip {
-		data = GZcompress(data)
-		if data == nil {
-			return nil, errors.New("EncodeAesGCM Gzip压缩数据失败")
-		}
-	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, errors.New("EncodeAesGCM 新建AES加密器失败" + err.Error())
@@ -136,42 +123,5 @@ func DecodeAesGCM(enddata []byte, key []byte, adddata []byte) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("DecodeAesGCM 解密AES数据出错! " + err.Error())
 	}
-	if isongzip {
-		dedata = GZdecompress(dedata)
-		if dedata == nil {
-			return nil, errors.New("DecodeAesGCM 解压缩Gzip数据出错! ")
-		}
-	}
 	return dedata, err
-}
-
-func GZcompress(indata []byte) []byte {
-	var b bytes.Buffer
-	gz := gzip.NewWriter(&b)
-	//设置第三库的分块压缩门限和最大并行压缩数
-	gz.SetConcurrency(4096, runtime.GOMAXPROCS(0))
-	if _, err := gz.Write(indata); err != nil {
-		return nil
-	}
-	if err := gz.Flush(); err != nil {
-		return nil
-	}
-	if err := gz.Close(); err != nil {
-		return nil
-	}
-	return b.Bytes()
-}
-
-func GZdecompress(indata []byte) []byte {
-	rdata := bytes.NewReader(indata)
-	gz, err := gzip.NewReader(rdata)
-	if err != nil {
-		return nil
-	}
-	var buf bytes.Buffer
-	// 从 Reader 中读取出数据
-	if _, err := buf.ReadFrom(gz); err != nil {
-		return nil
-	}
-	return buf.Bytes()
 }
