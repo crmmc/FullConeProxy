@@ -12,7 +12,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 4
+var mybufsize int = 1024 * 2
 
 func (r *AClient) SetDebug(mode bool) {
 	r.IsDebug = mode
@@ -188,6 +188,12 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		myip := socks5conn.LocalAddr().(*net.TCPAddr).IP
 		//解析得到的地址和端口数据
 		atmp := pubpro.BytesToTcpAddr(buf[3:n])
+		if atmp == nil {
+			if r.IsDebug {
+				log.Printf("CLIENT 解析UDP地址数据错误 [%x]\n", buf[3:n])
+			}
+			return false
+		}
 		//为了完成Fullcone，每个udp都开一个单独的socks5 UDP服务器，因此发送UDP数据的目标仅限申请的IP
 		//解析的SOCSK5要发送数据的目标地址和端口
 		clientudpaddr := &net.UDPAddr{IP: socks5conn.RemoteAddr().(*net.TCPAddr).IP, Port: atmp.Port}
@@ -303,9 +309,9 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		defer udpconn.Close()
 		buf := make([]byte, 4)
 		var err error
+		//SOCKS5 TCP READ无限超时，因为UDP不断，TCP不断
+		socks5conn.SetReadDeadline(time.Time{})
 		for {
-			//SOCKS5 TCP READ无限超时，因为UDP不断，TCP不断
-			socks5conn.SetReadDeadline(time.Time{})
 			_, err = socks5conn.Read(buf)
 			if err != nil {
 				return

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -105,8 +104,7 @@ func BytesToTcpAddr(netbyte []byte) *net.TCPAddr {
 	}
 	switch netbyte[0] {
 	case 0x01:
-
-		if len(netbyte) < 7 {
+		if len(netbyte) != 7 {
 			return nil
 		}
 		RTAddr.IP = netbyte[1:5]
@@ -120,13 +118,13 @@ func BytesToTcpAddr(netbyte []byte) *net.TCPAddr {
 		}
 	case 0x04:
 		//	IP V6 address: X'04'
-		if len(netbyte) < 19 {
+		if len(netbyte) != 19 {
 			return nil
 		}
 		RTAddr.IP = netbyte[1:17]
 		RTAddr.Port = BytesTouInt16(netbyte[17:19])
 	default:
-		log.Printf("无法识别的地址类型数据 , |%x| \n", netbyte)
+		return nil
 	}
 	return RTAddr
 }

@@ -10,10 +10,10 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 4
+var mybufsize int = 1024 * 2
 
-//清理随机数黑名单的时间，每30秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
-var checktime int = 30
+//清理随机数黑名单的时间，每15秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
+var checktime int = 15
 
 //全局的Nonce记录，这个用来检测重放,自己写的一个FIFO队列
 var noncerecord pubpro.Queue = pubpro.Queue{}
@@ -52,7 +52,7 @@ func noncechecker() {
 		//采用仅写时加锁（乐观锁），感觉有可能出问题，但是不想放弃这一点点效率
 		noncerecord.Del()
 	}
-	//太过频繁的轮训消耗机器资源
+	//太过频繁的轮询消耗机器资源
 	time.Sleep(time.Duration(checktime) * time.Second)
 }
 
@@ -185,9 +185,7 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
 	dedata, err = mycrypto.DecryptFrom(r.connfromclient, key, nil)
 	if err != nil {
-		if *r.Isdebug {
-			log.Println("SERVER: 解密指令包失败 , ", err.Error())
-		}
+		log.Printf("SERVER: 握手失败 [%s]--x->[SERVER] ERROR:[%s]\n", r.connfromclient.RemoteAddr().String(), err.Error())
 		return false
 	}
 	//首包数据长度
@@ -231,6 +229,12 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	if dedata[16] == 0x01 {
 		//解析得到的目标地址
 		dstAddr := pubpro.BytesToTcpAddr(dedata[17:n])
+		if dstAddr == nil {
+			if *r.Isdebug {
+				log.Printf("SERVER: 客户端请求了错误的地址数据 [%x] ,主动关闭连接.\n", dedata[17:n])
+			}
+			return false
+		}
 		fmt.Printf("SERVER: TCP CONNECT [%s]->[SERVER]->[%s]\n", r.connfromclient.RemoteAddr().String(), dstAddr.String())
 		//这一进程不会退出，所以发送过去数据指针
 		return r.procrsstcp(dstAddr)
@@ -393,6 +397,10 @@ func (r *processer) processudp() bool {
 				log.Println("SERVER UoT隧道读数据失败 , ", err1.Error())
 			}
 			break
+		}
+		if len(fromlocaldata) < 5 {
+			fmt.Printf("SERVER 来自LOCAL的过短UDP数据包 |%x|\n", fromlocaldata)
+			return false
 		}
 		if *r.Isdebug {
 			fmt.Printf("SERVER 来自LOCAL的UDP数据包 |%x|\n", fromlocaldata)

@@ -1,4 +1,5 @@
 @echo off
-:moreonce
-curl https://www.baidu.com --socks5-hostname 127.0.0.1:10805 -o NUL >NUL 2>NUL
-goto moreonce
+echo traceing %1
+:goa
+curl %1 --socks5-hostname 127.0.0.1:10805 >NUL 2>NUL
+goto goa
