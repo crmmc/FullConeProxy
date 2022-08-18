@@ -12,11 +12,10 @@ import (
 
 	"./client"
 	"./mycrypto"
-	"./pubpro"
 	"./server"
 )
 
-var version string = "v1.2.0 Stable"
+var version string = "v1.2.2 Stable"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -24,11 +23,12 @@ func main() {
 	socks5listen := flag.String("l", "[::]:10805", " only for client mode, set socks5 server listen address and port , default is [::]:10805")
 	remoteaddr := flag.String("r", "127.0.0.1:10010", "only usr for client mode, set remote server address and port ,default is 127.0.0.1:10010, Multiple servers can be used at the same time. Each server address is separated by commas. The order of server access password must correspond to the server address. The password string is also separated by commas")
 	locallisten := flag.String("s", "127.0.0.1:10010", "only use for server mode,set server local listen address and port, default is 127.0.0.1:10010")
-	stringkey := flag.String("w", "TESTMEBABY", "AES-256-GCM Mode Key ,input any string,default is TESTMEBABY,The server password sequence must correspond to the server address sequence, and the passwords are separated by commas,In server mode, only the first password will be used")
+	stringkey := flag.String("k", "TESTMEBABY", "AES-256-GCM Mode Key ,input any string,default is TESTMEBABY,The server password sequence must correspond to the server address sequence, and the passwords are separated by commas,In server mode, only the first password will be used")
 	tcptimeout := flag.Int("tcptimeout", 30, "SET TCP Timeout,should not lower tha UDP Timeout")
 	udptimeout := flag.Int("udptimeout", 150, "SET UDP timeout,should larger than TCO Timeout")
 	ondebug := flag.Bool("debug", false, "ON DEBUG MODE")
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
+	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
 	loweraes := flag.Bool("lower", false, "Use lower security encryption methods(AES-128-GCM) instead of AES-256-GCM , This option will affect the encryption of all passwords. When using multiple servers, please note that the password encryption mode used by each server cannot be customized")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
@@ -47,7 +47,6 @@ func main() {
 		}
 		f.Close()
 	}
-	pubpro.SetDebug(*ondebug)
 	mycrypto.SetDebug(*ondebug)
 
 	var err error
@@ -80,6 +79,7 @@ func main() {
 		ac.SetDebug(*ondebug)
 		ac.SetTCPReadTimeout(*tcptimeout)
 		ac.SetUDPLifeTime(*udptimeout)
+		ac.ServerChoiceRandom = !*serverchoicemode
 		if *ontest {
 			go ac.StartSocks5(*socks5listen, sconfig)
 		} else {

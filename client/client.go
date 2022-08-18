@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 8
+var mybufsize int = 1024 * 4
 
 func (r *AClient) SetDebug(mode bool) {
 	r.IsDebug = mode
@@ -35,12 +36,13 @@ type ServerConfig struct {
 //不要在这里的Timeout使用time。Time，因为这样的话全部用的都是指向一块内存地址的Time。time，而这个对象在到达指定时间之后就会
 //到时间，所有的连接都被设置到这个计时器，就会导致一个计时器到时间，立马让所有使用这个计时器的连接回报IO Timeout错误，导致程序废掉
 type AClient struct {
-	serverconfig    []ServerConfig
-	tcpReadTimeout  int  //TCP Read Timeout
-	tcpWriteTimeout int  //TCP Write Timeout
-	udpLifeTime     int  //UDP的ReadWrite Timeout
-	tcpNODELAY      bool //TCP的无延迟发送选项
-	IsDebug         bool //是否处于调试模式
+	serverconfig       []ServerConfig
+	tcpReadTimeout     int  //TCP Read Timeout
+	tcpWriteTimeout    int  //TCP Write Timeout
+	udpLifeTime        int  //UDP的ReadWrite Timeout
+	tcpNODELAY         bool //TCP的无延迟发送选项
+	IsDebug            bool //是否处于调试模式
+	ServerChoiceRandom bool //是否随机取服务器，还是按顺序使用服务器，将靠后的服务器作为备份使用
 }
 
 func (r *AClient) Init() {
@@ -49,6 +51,7 @@ func (r *AClient) Init() {
 	r.udpLifeTime = 600
 	r.tcpNODELAY = true
 	r.IsDebug = false
+	r.ServerChoiceRandom = true
 }
 
 //Client主程序
@@ -80,9 +83,7 @@ func (r *AClient) StartSocks5(socks5listenaddr string, serverconfig []ServerConf
 		}
 		aconn.SetLinger(0)             //接收到一个SOCKS5连接,设置连接异常时立即关闭
 		aconn.SetNoDelay(r.tcpNODELAY) //设置TCP NO DELEY标志
-		aconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
-		aconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
-		go r.process(aconn) //交给SOCKS5指令处理部分
+		go r.process(aconn)            //交给SOCKS5指令处理部分
 	}
 }
 
@@ -92,6 +93,8 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	buf := make([]byte, mybufsize) //读数据的buf
 	var n int
 	var err error
+	//一个SOCKS5握手怎么能超过10秒是吧，超过就废了它
+	socks5conn.SetReadDeadline(time.Now().Add(time.Duration(10) * time.Second))
 	n, err = socks5conn.Read(buf)
 	// 只支持版本5
 	if err != nil || buf[0] != 0x05 {
@@ -130,8 +133,9 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	//保证此进程退出的时候,建立的连接得到释放
 	defer serverconn.Close()
 	//由客户端生成一个长16字节的随机数,之后将作为协议加密时的AES GCM加密方式 附加验证数据使用
-	nownonce := mycrypto.Makenonce()
-	if nownonce == nil {
+	var nownonce []byte
+	nownonce, err = mycrypto.Makenonce()
+	if err != nil {
 		log.Println("LOCAL 随机数生成失败！")
 		return false
 	}
@@ -147,18 +151,9 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	+---------------+--------------+--------------+----------+----------+
 			**/
 	//处理好数据后,发送数据到服务器
-	//首包用的附加数据为当前时间(精确到分钟),这样防止时间差距太大的重放攻击
-	//但是这样的话,服务器和客户端就必须时间无差别,且时区必须一致
-	timeStamp := time.Now().Unix()
-	timeLayout := "2006-01-02 15:04"
-	timeStr := time.Unix(timeStamp, 0).Format(timeLayout)
-	var adddata []byte
-	adddata, err = mycrypto.Strtokey128(timeStr)
-	if err != nil {
-		log.Println("LOCAL 生成首包时间戳失败! ,", err.Error())
-		return false
-	}
-	_, err = mycrypto.EncryptTo(pubpro.ConnectBytes(pubpro.ConnectBytes(nownonce, buf[1:2]), buf[3:n]), serverconn, key, adddata)
+	//在加密函数那里写了若是附加数据为nil，则自动给包加(时间戳与key)的MD5作为附加数据，这样的话首包的安全性能得到更大保障
+	//解包使用类似V2的做法，可以允许LOCAL与SERVER时间相差正负两秒。
+	_, err = mycrypto.EncryptTo(pubpro.ConnectBytes(pubpro.ConnectBytes(nownonce, buf[1:2]), buf[3:n]), serverconn, key, nil)
 	if err != nil {
 		log.Println("LOCAL 发送指令到SERVER失败！ , ", err.Error())
 		return false
@@ -166,14 +161,14 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	switch buf[1] {
 	case 0x01:
 		// TCP CONNECT方法
-		fmt.Printf("SOCKS5 [%s] -> TCP CONNECT\n", socks5conn.RemoteAddr().String())
+		fmt.Printf("SOCKS5: TCP CONNECT [%s]<=>[Local]<=>[%s][SERVER]\n", socks5conn.RemoteAddr().String(), serverconn.RemoteAddr().String())
 		//回复socks5接收连接
 		socks5conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		//开始处理TCP数据
 		return r.processtcp(socks5conn, serverconn, &key, &nownonce)
 	case 0x03:
 		// UDP 方法
-		fmt.Printf("SOCKS5 [%s] -> UDP ASSOCIATE\n", socks5conn.RemoteAddr().String())
+		fmt.Printf("SOCKS5: UDP ASSOCIATE [%s]<=>[Local]<=>[%s][SERVER]\n", socks5conn.RemoteAddr().String(), serverconn.RemoteAddr().String())
 		//本地SOCKS5 UDP服务连接
 		var udpconn *net.UDPConn
 		//随机选择一个可用的UDP端口给SOCKS5 UDP服务器用
@@ -187,10 +182,6 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		}
 		//方法退出时关闭这个UDP监听端口释放资源
 		defer udpconn.Close()
-		//设置这个UDP的读写超时
-		udpconn.SetDeadline(time.Now().Add(time.Second * time.Duration(r.udpLifeTime)))
-		//用于UoT的TCP连接要保持存活，所以TCP读超时时间不得短于UDP通道的存活时间
-		socks5conn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.udpLifeTime)))
 		//获取本地IP
 		//这个地方是第二个害得我浪费一天找的BUG所在的地方，用pubpro的getip函数，会导致找到的IP是通往公网的那个网卡的IP，会导致数据包无法按原路到达socks5客户端
 		//真的是找死我了,真的大半天,早上重构了一下代码
@@ -216,11 +207,10 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 			log.Println("LOCAL 无法回应SOCKS5的UDP请求!", err.Error())
 			return false
 		}
-		//return udpnat.UdpNat(udpconn) //本地Fullcone NAT测试func
 		return r.processudp(socks5conn, udpconn, clientudpaddr, serverconn, &key, &nownonce)
 	default:
 		// 0x02为BIND方法，我不打算支持，其他就是未定义方法了
-		log.Printf("LOCAL Socks5: Unknow Control Code |%x| From <- %s\n", buf[1], socks5conn.LocalAddr().String())
+		log.Printf("Local Socks5: Unknow Control Code |%x| From <- %s\n", buf[1], socks5conn.LocalAddr().String())
 		if r.IsDebug {
 			log.Println("LOCAL 不支持的方法！")
 		}
@@ -230,15 +220,25 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 }
 
 func (r *AClient) ConnectToAServer() (*net.TCPConn, []byte, error) {
-	var a *net.TCPConn
+	var a net.Conn
 	var err error
-	for _, i := range r.serverconfig {
-		a, err = net.DialTCP("tcp", nil, &i.ServerAddr)
-		if err == nil {
-			return a, i.ServerKey, err
-		}
+	//若是开启随机选择服务器，那就把服务器数组打乱
+	if r.ServerChoiceRandom && len(r.serverconfig) > 1 {
+		rand.Seed(time.Now().Unix())
+		rand.Shuffle(len(r.serverconfig), func(i int, j int) {
+			r.serverconfig[i], r.serverconfig[j] = r.serverconfig[j], r.serverconfig[i]
+		})
 	}
-	return nil, nil, errors.New("未找到可用的服务器配置！")
+	for _, i := range r.serverconfig {
+		//连接服务器的超时保持,2秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
+		a, err = net.DialTimeout("tcp", i.ServerAddr.String(), time.Duration(2)*time.Second)
+		if err == nil {
+			return a.(*net.TCPConn), i.ServerKey, err
+		}
+		//鄙人认为，连接服务器失败算一个重要的信息，不能忽略
+		log.Printf("Local: --X->[%s][SERVER] Server Connect Failed!", i.ServerAddr.IP)
+	}
+	return nil, nil, errors.New("无可用的服务器以供选择")
 }
 
 //处理UDP数据包
@@ -271,6 +271,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		}
 		for {
 			//从服务器接收到的数据包都是打包好的UDP数据包，到这里加上UDP头部的三字节
+			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
 			data, receerr = mycrypto.DecryptFrom(serverconn, *key, *nownonce)
 			if receerr != nil {
 				if r.IsDebug {
@@ -279,6 +280,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 				break
 			}
 			data = pubpro.ConnectBytes([]byte{0x00, 0x00, 0x00}, data)
+			udpconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 			n, receerr = udpconn.WriteToUDP(data, udpreturn)
 			if receerr != nil {
 				if r.IsDebug {
@@ -302,6 +304,8 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		buf := make([]byte, 4)
 		var err error
 		for {
+			//SOCKS5 TCP READ无限超时，因为UDP不断，TCP不断
+			socks5conn.SetReadDeadline(time.Time{})
 			_, err = socks5conn.Read(buf)
 			if err != nil {
 				return
@@ -316,6 +320,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 	var err error
 	for {
 		//从LOCAL SOCKS5 UDP读数据
+		udpconn.SetReadDeadline(time.Now().Add(time.Duration(r.udpLifeTime) * time.Second))
 		rdn, newudprecv, err = udpconn.ReadFromUDP(buf)
 		if err != nil {
 			if r.IsDebug {
@@ -335,6 +340,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		if r.IsDebug {
 			fmt.Printf("LOCAL 转发%s的数据包到 SERVER |%x|, 大小:%s\n", newudprecv.String(), buf[3:rdn], pubpro.ReadableBytes(rdn))
 		}
+		serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 		//要去掉头部的三字节0,和服务器那边对应
 		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce)
 		if err != nil {
@@ -344,8 +350,9 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 			break
 		}
 	}
+	sip := serverconn.RemoteAddr().String()
 	serverconn.Close()
-	fmt.Println("Local: Socks5 UDP From:  ", udpreturn.String(), " <-  RECV: ", pubpro.ReadableBytes(<-localtosocks5udp), " SEND: ", pubpro.ReadableBytes(socks5tolocaludp))
+	fmt.Printf("Local: UDP ASSOCIATE [%s]<=>[Local]<=>[%s] SEND:%s RECV:%s\n", udpreturn.String(), sip, pubpro.ReadableBytes(<-localtosocks5udp), pubpro.ReadableBytes(socks5tolocaludp))
 	return true
 }
 
@@ -369,6 +376,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 		var err2 error
 		var tmpwrite int
 		for {
+			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
 			fromserverdata, err2 = mycrypto.DecryptFrom(serverconn, *key, *nownonce)
 			if err2 != nil {
 				if r.IsDebug {
@@ -376,6 +384,8 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 				}
 				break
 			}
+			//fmt.Printf("LOCAL 从服务器接收数据：|%x|->|%d|\n", fromserverdata, len(fromserverdata))
+			socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
 			tmpwrite, err2 = socks5conn.Write(fromserverdata)
 			if err2 != nil {
 				if r.IsDebug {
@@ -395,13 +405,15 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 	var err error
 	//临时的从SOCKS5接收到的数据大小
 	for {
-
+		socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
 		if ln, err = socks5conn.Read(buf); err != nil {
 			if r.IsDebug {
 				log.Println("LOCAL 从SOCKS5读取TCP数据失败 , ", err.Error())
 			}
 			break
 		} else {
+			//fmt.Printf("LOCAL 发送数据：|%x|->|%d|\n", buf[:ln], ln)
+			serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 			_, err = mycrypto.EncryptTo(buf[:ln], serverconn, *key, *nownonce)
 			if err != nil {
 				if r.IsDebug {
@@ -412,7 +424,10 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 			socks5tolocaltcp = socks5tolocaltcp + ln
 		}
 	}
+	//防止连接关闭过早出现nil
+	sip := serverconn.RemoteAddr().String()
+	cip := socks5conn.RemoteAddr().String()
 	serverconn.Close()
-	fmt.Println("Local: Socks5 TCP From: ", serverconn.RemoteAddr().String(), "  SEND:", pubpro.ReadableBytes(socks5tolocaltcp), " RECV:", pubpro.ReadableBytes(<-localtosocks5tcp))
+	fmt.Printf("Local: TCP CONNECT [%s]<=>[Local]<=>[%s][SERVER] SEND:%s RECV:%s\n", cip, sip, pubpro.ReadableBytes(socks5tolocaltcp), pubpro.ReadableBytes(<-localtosocks5tcp))
 	return true
 }

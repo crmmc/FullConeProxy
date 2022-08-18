@@ -10,7 +10,14 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 8
+var mybufsize int = 1024 * 4
+
+//清理随机数黑名单的时间，每30秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
+var checktime int = 30
+
+//全局的Nonce记录，这个用来检测重放,自己写的一个FIFO队列
+var noncerecord pubpro.Queue = pubpro.Queue{}
+var checkerrunning = false
 
 //一个Server
 type AServer struct {
@@ -23,14 +30,64 @@ type AServer struct {
 	Isdebug         bool         //是否处于调试模式
 }
 
+func noncenum() {
+	for {
+		fmt.Println("Nonce废纸篓数量:", noncerecord.Size())
+		time.Sleep(time.Duration(2) * time.Second)
+	}
+}
+
+func noncechecker() {
+	for {
+		var a *int64
+		_, a = noncerecord.GetFirst()
+		if a == nil {
+			break
+		}
+		if (*a - time.Now().Unix()) > 0 {
+			break
+		}
+		//FIFO队列，每次操作删除第一个,好处是每次只用检查最先加入的一个，第一个没有超时，后面的每一个元素都不可能超时
+		//所以可以直接停止检测，而第一个超时那就检查第二个，直到检查到有没有超时的对象或者全部检查完为止
+		//采用仅写时加锁（乐观锁），感觉有可能出问题，但是不想放弃这一点点效率
+		noncerecord.Del()
+	}
+	//太过频繁的轮训消耗机器资源
+	time.Sleep(time.Duration(checktime) * time.Second)
+}
+
 func (r *AServer) Init() {
 	r.listener = nil
 	r.keybyte = nil
 	r.tcpReadTimeout = 60
-	r.tcpWriteTimeout = 15
+	r.tcpWriteTimeout = 5
 	r.udpLifeTime = 600
 	r.tcpNODELAY = true
 	r.Isdebug = false
+	//启动这个全局检查的goruntime，启动一遍就够了
+	if !checkerrunning {
+		if r.Isdebug {
+			go noncenum()
+		}
+		go noncechecker()
+		checkerrunning = true
+	}
+}
+
+//单独写Hangon，这样的话就可以让Go释放原来占用的内存空间，只剩下本次连接用的内存空间
+func HangOnConnect(hangedconn *net.TCPConn) {
+	defer hangedconn.Close()
+	log.Printf("SERVER 来自%s的连接被挂起", hangedconn.RemoteAddr().String())
+	buf := make([]byte, 64)
+	var err error
+	//更新读超时时间点，最多120秒没有数据写入就关闭连接
+	hangedconn.SetReadDeadline(time.Now().Add(time.Duration(120) * time.Second))
+	for {
+		_, err = hangedconn.Read(buf)
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (r *AServer) SetDebug(id bool) {
@@ -69,15 +126,13 @@ func (r *AServer) Close() {
 func (r *AServer) StartLoop() error {
 	defer r.Close()
 	for {
-		sconn, err := r.listener.Accept()
+		connfromclient, err := r.listener.Accept()
 		if err != nil {
 			log.Printf("SERVER %s 在接受连接时出现错误! %s\n", r.listener.Addr().String(), err.Error())
 			return err
 		}
-		sconn.(*net.TCPConn).SetLinger(0)
-		sconn.(*net.TCPConn).SetNoDelay(r.tcpNODELAY)
-		sconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
-		sconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
+		connfromclient.(*net.TCPConn).SetLinger(0)
+		connfromclient.(*net.TCPConn).SetNoDelay(r.tcpNODELAY)
 		var pc1 processer
 		//此处的变量一直不会改变值，所以传递指针
 		pc1.Isdebug = &r.Isdebug
@@ -86,7 +141,7 @@ func (r *AServer) StartLoop() error {
 		pc1.UdpLifeTime = &r.udpLifeTime
 		//服务器连接到目标这一段网络的质量通常认为是很好的，所以不需要开启这个选项
 		pc1.TcpNODELAY = &r.tcpNODELAY
-		go pc1.Process(sconn, r.keybyte)
+		go pc1.Process(connfromclient, r.keybyte)
 	}
 }
 
@@ -122,21 +177,13 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	//此进程一般不会退出除非处理完成，所以传递指针
 	r.connfromclient = sconn.(*net.TCPConn)
 	r.keybyte = &key
-	//生成现在的时间戳，解密首包
-	timeStamp := time.Now().Unix()
-	timeLayout := "2006-01-02 15:04"
-	timeStr := time.Unix(timeStamp, 0).Format(timeLayout)
-	//首包的附加消息
-	var adddata []byte
-	var err error
-	adddata, err = mycrypto.Strtokey128(timeStr)
-	if err != nil {
-		log.Println("SERVER 生成首包时间戳失败! ,", err.Error())
-		return false
-	}
 	//解密出来的完整首包数据
 	var dedata []byte
-	dedata, err = mycrypto.DecryptFrom(sconn, key, adddata)
+	var err error
+	//在加密函数那里写了若是附加数据为nil，则自动给包加(时间戳与key)的MD5作为附加数据，这样的话首包的安全性能得到更大保障
+	//解包使用类似V2的做法，可以允许LOCAL与SERVER时间相差正负两秒,若是nownonce为nil，则自动使用(当前正负两秒共计四个时间戳分别与key)的MD5作为附加数据验证，这样允许客户端与服务端有时间误差，消耗性能换安全性
+	r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
+	dedata, err = mycrypto.DecryptFrom(r.connfromclient, key, nil)
 	if err != nil {
 		if *r.Isdebug {
 			log.Println("SERVER: 解密指令包失败 , ", err.Error())
@@ -145,7 +192,7 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	}
 	//首包数据长度
 	n := len(dedata)
-	if err != nil || n < 21 {
+	if err != nil || n < 20 {
 		if *r.Isdebug {
 			log.Println("SERVER 指令包过短, ", n)
 		}
@@ -166,6 +213,16 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 
 	//分离出的随机数
 	r.nonce = dedata[0:16]
+	if noncerecord.Exist(r.nonce) {
+		log.Println("遭到重放攻击！！ 启用应对措施： 挂起连接")
+		log.Printf("来自： %s 的重放数据包 |%x| ,%s", r.connfromclient.RemoteAddr().String(), dedata, pubpro.ReadableBytes(len(dedata)))
+		//挂起连接，但是防止process退出导致process的自动关闭连接触发
+		r.connfromclient = nil
+		go HangOnConnect(sconn.(*net.TCPConn))
+		return false
+	} else {
+		noncerecord.Add(r.nonce)
+	}
 	if *r.Isdebug {
 		fmt.Printf("SERVER 收到随机数 nonce: %x\n", r.nonce)
 	}
@@ -174,12 +231,11 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	if dedata[16] == 0x01 {
 		//解析得到的目标地址
 		dstAddr := pubpro.BytesToTcpAddr(dedata[17:n])
-		if *r.Isdebug {
-			fmt.Println("SERVER: 发起TCP连接 -> ", dstAddr.String())
-		}
+		fmt.Printf("SERVER: TCP CONNECT [%s]->[SERVER]->[%s]\n", r.connfromclient.RemoteAddr().String(), dstAddr.String())
 		//这一进程不会退出，所以发送过去数据指针
-		return r.procrsstcp(&dstAddr)
+		return r.procrsstcp(dstAddr)
 	} else {
+		fmt.Printf("SERVER: UDP ASSOCIATE [%s]->[SERVER]->[?]\n", r.connfromclient.RemoteAddr().String())
 		return r.processudp()
 	}
 
@@ -188,16 +244,17 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 	defer r.Close()
 	var err2 error
-	r.tcptotarget, err2 = net.DialTCP("tcp", nil, raddr)
+	var dialed net.Conn
+	//超时时间是和TCP Write一样的
+	dialed, err2 = net.DialTimeout("tcp", raddr.String(), time.Duration(*r.TcpWriteTimeout)*time.Second)
 	if err2 != nil {
 		log.Println("SERVER: 发起TCP连接请求失败 , ", err2.Error())
 		return false
 	}
+	r.tcptotarget = dialed.(*net.TCPConn)
 	//设置服务器连接到目的地的连接的属性
 	r.tcptotarget.SetLinger(0)
 	r.tcptotarget.SetNoDelay(*r.TcpNODELAY)
-	r.tcptotarget.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpReadTimeout)))
-	r.tcptotarget.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpWriteTimeout)))
 	// 从LOCAL读然后发送到TARGET
 	servertotarget := make(chan int, 1)
 	go func() {
@@ -209,6 +266,7 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 		var dedata []byte
 		var err error
 		for {
+			r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
 			dedata, err = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce)
 			if err != nil {
 				if *r.Isdebug {
@@ -216,6 +274,8 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 				}
 				break
 			}
+			//每次写之前更新一下写超时的判定时间点
+			r.tcptotarget.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
 			n, err = r.tcptotarget.Write(dedata)
 			if err != nil {
 				if *r.Isdebug {
@@ -235,6 +295,8 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 	var ln int
 	var err error
 	for {
+		//每次读操作前更新一下读超时的时间点
+		r.tcptotarget.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
 		if ln, err = r.tcptotarget.Read(buf); err != nil {
 			if *r.Isdebug {
 				log.Println("SERVER 从TARGET读数据错误！, ", err.Error())
@@ -242,6 +304,8 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 			break
 		} else {
 			targettoserver = targettoserver + ln
+			//每次写前更新一下写超时的判定时间点
+			r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
 			_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce)
 			if err != nil {
 				break
@@ -250,14 +314,14 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 	}
 	//防止后面close后这个变量消失，这里新建一个变量存着Target的地址数据
 	TCPTOaddr := r.tcptotarget.RemoteAddr().String()
+	clink := r.connfromclient.RemoteAddr().String()
 	r.Close()
-	fmt.Println("SERVER TCP CONNECTION ", TCPTOaddr, "  SEND:", pubpro.ReadableBytes(<-servertotarget), "   RECV:", pubpro.ReadableBytes(targettoserver))
+	fmt.Printf("SERVER: TCP CONNECT [%s]->[SERVER]->[%s] SEND:%s RECV:%s\n", clink, TCPTOaddr, pubpro.ReadableBytes(<-servertotarget), pubpro.ReadableBytes(targettoserver))
 	return true
 }
 
 func (r *processer) processudp() bool {
 	defer r.Close()
-
 	var err1 error
 	//laddr为nil时,监听所有地址和随机选择可用端口
 	r.udptotarget, err1 = net.ListenUDP("udp", nil)
@@ -265,14 +329,9 @@ func (r *processer) processudp() bool {
 		log.Println("SERVER UDP端口监听启动失败！ , ", err1.Error())
 		return false
 	}
-	//设置UDP连接的最大保持时间
-	r.udptotarget.SetDeadline(time.Now().Add(time.Second * time.Duration(*r.UdpLifeTime)))
-	//延长SERVER到LOCAL连接的保持时间，这个时间必须不小于UDP连接的存活时间
-	r.connfromclient.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.UdpLifeTime)))
 	if *r.Isdebug {
 		fmt.Println("SERVER 开放UDP端口 -> ", r.udptotarget.LocalAddr().String())
 	}
-
 	//目标返回到服务器UDP端口的数据总大小
 	targettoserverudp := make(chan int, 1)
 	go func() {
@@ -288,6 +347,8 @@ func (r *processer) processudp() bool {
 		var writebuf []byte
 		buf := make([]byte, mybufsize)
 		for {
+			//更新UDP的最大读写超时判定时间点
+			r.udptotarget.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.UdpLifeTime)))
 			rcn, saddr, err2 = r.udptotarget.ReadFromUDP(buf)
 			if err2 != nil {
 				if *r.Isdebug {
@@ -305,6 +366,8 @@ func (r *processer) processudp() bool {
 			if *r.Isdebug {
 				fmt.Printf("SERVER 送回UDP数据包: |%x|%x| , %s <- %s\n", writebuf, buf[:rcn], pubpro.ReadableBytes(rcn), saddr.String())
 			}
+			//更新一下写超时的判定时间点
+			r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
 			//通过命令连接送回UDP数据包
 			_, err2 := mycrypto.EncryptTo(pubpro.ConnectBytes(writebuf, buf[:rcn]), r.connfromclient, *r.keybyte, r.nonce)
 			if err2 != nil {
@@ -323,6 +386,7 @@ func (r *processer) processudp() bool {
 	//SERVER发往Target的总数据包大小
 	var servertotargetudp int
 	for {
+		r.connfromclient.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpReadTimeout)))
 		fromlocaldata, err1 = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce)
 		if err1 != nil {
 			if *r.Isdebug {
@@ -367,6 +431,7 @@ func (r *processer) processudp() bool {
 			}
 			continue //跳过这个包
 		}
+		r.udptotarget.SetWriteDeadline(time.Now().Add(time.Duration(*r.UdpLifeTime) * time.Second))
 		n, err1 = r.udptotarget.WriteToUDP(realdata, targetaddr)
 		if err1 != nil {
 			log.Println("SERVER 发送UDP数据到目的地失败！ ， ", err1.Error())
@@ -378,7 +443,8 @@ func (r *processer) processudp() bool {
 		servertotargetudp = servertotargetudp + n
 
 	}
+	clink := r.connfromclient.RemoteAddr().String()
 	r.Close()
-	fmt.Println("UDP 方式 : SEND ", pubpro.ReadableBytes(servertotargetudp), " RECV", pubpro.ReadableBytes(<-targettoserverudp))
+	fmt.Printf("SERVER: UDP ASSOCIATE [%s]->[SERVER]->[?] SEND:%s RECV:%s\n ", clink, pubpro.ReadableBytes(servertotargetudp), pubpro.ReadableBytes(<-targettoserverudp))
 	return true
 }
