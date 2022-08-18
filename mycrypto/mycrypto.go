@@ -2,7 +2,6 @@ package mycrypto
 
 import (
 	"bytes"
-	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -12,9 +11,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"time"
 
 	"../pubpro"
+	gzip "github.com/klauspost/pgzip"
 )
 
 var isdebug bool = true
@@ -147,6 +148,8 @@ func DecodeAesGCM(enddata []byte, key []byte, adddata []byte) ([]byte, error) {
 func GZcompress(indata []byte) []byte {
 	var b bytes.Buffer
 	gz := gzip.NewWriter(&b)
+	//设置第三库的分块压缩门限和最大并行压缩数
+	gz.SetConcurrency(4096, runtime.GOMAXPROCS(0))
 	if _, err := gz.Write(indata); err != nil {
 		return nil
 	}

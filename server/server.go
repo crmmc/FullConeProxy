@@ -10,7 +10,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 2
+var mybufsize int = 1024 * 4
 
 //清理随机数黑名单的时间，每15秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
 var checktime int = 15

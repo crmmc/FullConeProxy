@@ -12,7 +12,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 2
+var mybufsize int = 1024 * 4
 
 func (r *AClient) SetDebug(mode bool) {
 	r.IsDebug = mode

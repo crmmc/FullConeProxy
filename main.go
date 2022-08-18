@@ -15,7 +15,7 @@ import (
 	"./server"
 )
 
-var version string = "v1.2.4 stable"
+var version string = "v1.2.5 Bate"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -30,7 +30,7 @@ func main() {
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
 	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
 	loweraes := flag.Bool("lower", false, "Use lower security encryption methods(AES-128-GCM) instead of AES-256-GCM , This option will affect the encryption of all passwords. When using multiple servers, please note that the password encryption mode used by each server cannot be customized")
-	isongzip := flag.Bool("gzip", false, "On Gzip data compress method for cost less")
+	isongzip := flag.Bool("gzip", false, "On Gzip data compress method for cost less flow")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
 	if *showhelp {
