@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"runtime/pprof"
 	"strings"
 
@@ -16,10 +15,10 @@ import (
 )
 
 //手写版本号
-var version string = "v1.2.7 Stable"
+var version string = "v1.2.9 Bate"
 
 //给密码生成加个salt
-var keysalt string = "UnKnownCharsetGBK"
+var keysalt string = "HAHA1.2.9"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -28,12 +27,13 @@ func main() {
 	remoteaddr := flag.String("r", "127.0.0.1:10010", "only usr for client mode, set remote server address and port ,default is 127.0.0.1:10010, Multiple servers can be used at the same time. Each server address is separated by commas. The order of server access password must correspond to the server address. The password string is also separated by commas")
 	locallisten := flag.String("s", "127.0.0.1:10010", "only use for server mode,set server local listen address and port, default is 127.0.0.1:10010")
 	stringkey := flag.String("k", "TESTMEBABY", "AES-256-GCM Mode Key ,input any string,default is TESTMEBABY,The server password sequence must correspond to the server address sequence, and the passwords are separated by commas,In server mode, only the first password will be used")
-	tcptimeout := flag.Int("tcptimeout", 30, "SET TCP Timeout,should not lower tha UDP Timeout")
-	udptimeout := flag.Int("udptimeout", 150, "SET UDP timeout,should larger than TCO Timeout")
+	tcptimeout := flag.Int("tcptimeout", 60, "SET TCP Timeout,should not lower tha UDP Timeout")
+	udptimeout := flag.Int("udptimeout", 120, "SET UDP timeout,should larger than TCO Timeout")
 	ondebug := flag.Bool("debug", false, "ON DEBUG MODE")
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
 	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
 	loweraes := flag.Bool("lower", false, "Use lower security encryption methods(AES-128-GCM) instead of AES-256-GCM , This option will affect the encryption of all passwords. When using multiple servers, please note that the password encryption mode used by each server cannot be customized")
+	doyoufuckit := flag.Bool("fuck", false, "Switch up will enable Attack to the replay server")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
 	if *showhelp {
@@ -45,13 +45,13 @@ func main() {
 		if err != nil {
 			log.Fatal("could not create memory profile: ", err)
 		}
-		runtime.GC() // get up-to-date statistics
 		if err := pprof.WriteHeapProfile(f); err != nil {
 			log.Fatal("could not write memory profile: ", err)
 		}
 		f.Close()
 	}
 	mycrypto.SetDebug(*ondebug)
+	server.ModeFuckAttacker(*doyoufuckit)
 	var err error
 	var sconfig []client.ServerConfig
 

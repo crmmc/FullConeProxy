@@ -50,7 +50,7 @@ type AClient struct {
 func (r *AClient) Init() {
 	r.tcpReadTimeout = 60
 	r.tcpWriteTimeout = 15
-	r.udpLifeTime = 600
+	r.udpLifeTime = 60
 	r.tcpNODELAY = true
 	r.IsDebug = false
 	r.ServerChoiceRandom = true
@@ -286,8 +286,8 @@ func (r *AClient) ConnectToAServer() (*net.TCPConn, []byte, error) {
 		})
 	}
 	for _, i := range r.serverconfig {
-		//连接服务器的超时保持,2秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
-		a, err = net.DialTimeout("tcp", i.ServerAddr.String(), time.Duration(2)*time.Second)
+		//连接服务器的超时保持,5秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
+		a, err = net.DialTimeout("tcp", i.ServerAddr.String(), time.Duration(5)*time.Second)
 		if err == nil {
 			return a.(*net.TCPConn), i.ServerKey, err
 		}
@@ -379,7 +379,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		udpconn.SetReadDeadline(time.Now().Add(time.Duration(r.udpLifeTime) * time.Second))
 		rdn, newudprecv, err = udpconn.ReadFromUDP(buf)
 		if err != nil {
-			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "reset") {
 				log.Println("LOCAL 从Socks5 UDP 读数据出错 , ", err.Error())
 			}
 			//UDP读出错，直接退出，结束SOCKS5连接
@@ -400,7 +400,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		//要去掉头部的三字节0,和服务器那边对应
 		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce, []byte{0xff, 0xff})
 		if err != nil {
-			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "reset") {
 				log.Println("SOCKS5 UDP打包数据加密失败,关闭连接 , ", err.Error())
 			}
 			break
@@ -463,7 +463,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 	for {
 		socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
 		if ln, err = socks5conn.Read(buf); err != nil {
-			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "reset") {
 				log.Println("LOCAL 从SOCKS5读取TCP数据失败 , ", err.Error())
 			}
 			break

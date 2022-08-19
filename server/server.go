@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ var checktime int = 15
 //全局的Nonce记录，这个用来检测重放,自己写的一个FIFO队列
 var noncerecord pubpro.Queue = pubpro.Queue{}
 var checkerrunning = false
+var fuckattacker = false
 
 //一个Server
 type AServer struct {
@@ -30,6 +32,67 @@ type AServer struct {
 	udpLifeTime     int          //UDP的ReadWrite Timeout
 	tcpNODELAY      bool         //TCP的无延迟发送选项
 	Isdebug         bool         //是否处于调试模式
+}
+
+func (r *AServer) Init() {
+	r.listener = nil
+	r.keybyte = nil
+	r.tcpReadTimeout = 60
+	r.tcpWriteTimeout = 15
+	r.udpLifeTime = 60
+	r.tcpNODELAY = true
+	r.Isdebug = false
+	//启动这个全局检查的goruntime，启动一遍就够了
+	if !checkerrunning {
+		if r.Isdebug {
+			go noncenum()
+		}
+		go noncechecker()
+		checkerrunning = true
+	}
+}
+
+//开启这个后，会对重放者发动反击，对其不断地，满带宽的发送随机数据，相当于同归于尽，会大量消耗服务器流量，会不会因为这个被封呢
+func ModeFuckAttacker(mode bool) {
+	fuckattacker = mode
+}
+
+//单独写Hangon，这样的话就可以让Go释放原来占用的内存空间，只剩下本次连接用的内存空间
+func HangOnConnect(hangedconn *net.TCPConn) {
+	defer hangedconn.Close()
+	log.Printf("SERVER 来自[%s]的连接被重放处理挂起", hangedconn.RemoteAddr().String())
+	if fuckattacker {
+		log.Printf("SERVER决定惩罚发起重放的服务器 [%s]\n", hangedconn.RemoteAddr().String())
+		hangedconn.SetWriteDeadline(time.Now().Add(time.Duration(5) * time.Second))
+		randomdata := make([]byte, 64)
+		go func() {
+			var allsenddata int
+			var errord error
+			var rdn int
+			for {
+				rand.Read(randomdata)
+				rdn, errord = hangedconn.Write(append([]byte("EAT MY SHIT"), randomdata...))
+				if errord != nil {
+					break
+				}
+				allsenddata = allsenddata + rdn
+			}
+			log.Printf("SERVER 惩罚发起重放的服务器 [%s] 结束，总共发送了垃圾数据: [%s]\n", hangedconn.RemoteAddr().String(), pubpro.ReadableBytes(allsenddata))
+		}()
+	}
+	buf := make([]byte, 10)
+	var err error
+	var rdn int
+	//更新读超时时间点，最多120秒没有数据写入就关闭连接
+	hangedconn.SetReadDeadline(time.Now().Add(time.Duration(10) * time.Second))
+	for {
+		rdn, err = hangedconn.Read(buf)
+		if err != nil {
+			log.Printf("SERVER 重放连接[%s] 结束! [%s]\n", hangedconn.RemoteAddr().String(), err.Error())
+			return
+		}
+		log.Printf("来自[%s]的重放数据: |%x| %s\n", hangedconn.RemoteAddr().String(), buf[:rdn], pubpro.ReadableBytes(rdn))
+	}
 }
 
 func noncenum() {
@@ -56,43 +119,6 @@ func noncechecker() {
 	}
 	//太过频繁的轮询消耗机器资源
 	time.Sleep(time.Duration(checktime) * time.Second)
-}
-
-func (r *AServer) Init() {
-	r.listener = nil
-	r.keybyte = nil
-	r.tcpReadTimeout = 60
-	r.tcpWriteTimeout = 5
-	r.udpLifeTime = 600
-	r.tcpNODELAY = true
-	r.Isdebug = false
-	//启动这个全局检查的goruntime，启动一遍就够了
-	if !checkerrunning {
-		if r.Isdebug {
-			go noncenum()
-		}
-		go noncechecker()
-		checkerrunning = true
-	}
-}
-
-//单独写Hangon，这样的话就可以让Go释放原来占用的内存空间，只剩下本次连接用的内存空间
-func HangOnConnect(hangedconn *net.TCPConn) {
-	defer hangedconn.Close()
-	log.Printf("SERVER 来自%s的连接被挂起", hangedconn.RemoteAddr().String())
-	buf := make([]byte, 64)
-	var err error
-	var rdn int
-	//更新读超时时间点，最多120秒没有数据写入就关闭连接
-	hangedconn.SetReadDeadline(time.Now().Add(time.Duration(120) * time.Second))
-	for {
-		rdn, err = hangedconn.Read(buf)
-		if err != nil {
-			log.Printf("SERVER 重放连接[%s] 结束! [%s]\n", hangedconn.RemoteAddr().String(), err.Error())
-			return
-		}
-		log.Printf("来自[%s]的重放数据: |%x| %s\n", hangedconn.RemoteAddr().String(), buf[:rdn], pubpro.ReadableBytes(rdn))
-	}
 }
 
 func (r *AServer) SetDebug(id bool) {
@@ -292,7 +318,7 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 			r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
 			dedata, err = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce, []byte{0xff, 0xff})
 			if err != nil {
-				if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
+				if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset") {
 					log.Println("SERVER: 从LOCAL读数据错误！, ", err.Error())
 				}
 				break
@@ -321,7 +347,7 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 		//每次读操作前更新一下读超时的时间点
 		r.tcptotarget.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
 		if ln, err = r.tcptotarget.Read(buf); err != nil {
-			if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
+			if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset") {
 				log.Println("SERVER 从TARGET读数据错误！, ", err.Error())
 			}
 			break
