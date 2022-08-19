@@ -1,13 +1,16 @@
 package mycrypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"net"
 	"time"
@@ -17,6 +20,7 @@ import (
 
 var isdebug bool = true
 var maxallowtimeerror int64 = 10 //最大允许收发数据包的两端时间相差10秒
+var timeiv int64 = -1956         //时间戳的偏移量，防止被记录包发送时间后用密码解出包的内容，其实这一点应该随机生成更好
 
 func SetDebug(mode bool) {
 	isdebug = mode
@@ -27,8 +31,9 @@ func Strtokey128(str string) ([]byte, error) {
 }
 
 func Strtokey256(str string) ([]byte, error) {
-	bytes, err := Strtokey128(str)
-	return pubpro.ConnectBytes(bytes, bytes), err
+	hash := sha256.New()
+	hash.Write([]byte(str))
+	return hash.Sum(nil), nil
 }
 
 func Makenonce() ([]byte, error) {
@@ -37,48 +42,100 @@ func Makenonce() ([]byte, error) {
 	return nonce, err
 }
 
-func DecryptFrom(sconn net.Conn, key []byte, nownonce []byte) ([]byte, error) {
-	numsizebyte, err := pubpro.ReadbytesFrom(sconn, 4)
+/*
+在加密数据前面加上随机填充的内容以混淆，随机填充内容随机长度（0-255），由数据包第一个字节决定，结构
+ +--------------------+-------------+----------------+----------+---------+
+ | Random data length | Random Data | payload length | playload |  CRC32  |
+ +--------------------+-------------+----------------+----------+---------+
+ |       1 byte       |   variable  |     4 byte     | variable |  4 byte |
+ +--------------------+-------------+----------------+----------+---------+
+
+*/
+
+func DecryptFrom(sconn net.Conn, key []byte, nownonce []byte, adddata []byte) ([]byte, error) {
+	randomsize := make([]byte, 1)
+	_, err := sconn.Read(randomsize)
 	if err != nil {
-		if isdebug {
-			log.Println("数据接收模块发现无法识别的包大小! , ", err.Error())
-		}
-		return nil, err
+		return nil, errors.New("无法收到随机数据长度 , " + err.Error())
+	}
+	var randomdata []byte
+	randomdata, err = pubpro.ReadbytesFrom(sconn, int64(uint8(randomsize[0])))
+	if err != nil {
+		return nil, errors.New("无法收到随机数据 , " + err.Error())
+	}
+	var numsizebyte []byte
+	numsizebyte, err = pubpro.ReadbytesFrom(sconn, 4)
+	if err != nil {
+		return nil, errors.New("无法收到加密数据长度 " + err.Error())
 	}
 	datasize := int64(pubpro.BytesToInt32(numsizebyte))
 	var enddata []byte
 	enddata, err = pubpro.ReadbytesFrom(sconn, datasize)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("无法收到加密数据 " + err.Error())
+	}
+	//首先校验包的完整性CRC32
+	var packageCRC32 []byte
+	packageCRC32, err = pubpro.ReadbytesFrom(sconn, 4)
+	if err != nil {
+		return nil, errors.New("无法收到包的CRC32")
+	}
+	//拼接已经接受到的数据 |randomsize|randomdata|numsizebyte|enddata|,计算CRC32
+	nowCRC32num := crc32.ChecksumIEEE(append(randomsize, append(randomdata, append(numsizebyte, enddata...)...)...))
+	if !bytes.Equal(packageCRC32, pubpro.Int32ToBytes(int32(nowCRC32num))) {
+		return nil, errors.New("数据包CRC32校验不通过！可能正在遭受主动探测")
 	}
 	//时间戳与KEY一起HASH得到附加数据，参考v2的想法
 	if nownonce == nil {
-		datasize = time.Now().Unix()
+		//这里给获取的时间戳做一个独特的运算，防止密码被知道后，通过被记录的包发送时间运算出包的内容
+		//偏移量改那个全局变量
+		//借用前面的变量datasize储存timestmp
+		datasize = time.Now().Unix() + timeiv
 		var ddata []byte
 		for tmpsize := maxallowtimeerror * int64(-1); tmpsize < maxallowtimeerror; tmpsize++ {
-			nownonce = pubpro.MD5toBytes(pubpro.ConnectBytes(key, pubpro.Int64toBytes(datasize+tmpsize)))
-			ddata, err = DecodeAesGCM(enddata, key, nownonce)
+			nownonce = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(datasize+tmpsize)...))
+			ddata, err = DecodeAesGCM(enddata, key, nownonce, adddata)
 			if err == nil {
 				return ddata, nil
 			}
 		}
 	} else {
-		enddata, err = DecodeAesGCM(enddata, key, nownonce)
+		enddata, err = DecodeAesGCM(enddata, key, nownonce, adddata)
 	}
 	return enddata, err
 }
 
-func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte) (int, error) {
-	if nownonce == nil {
-		nownonce = pubpro.MD5toBytes(pubpro.ConnectBytes(key, pubpro.Int64toBytes(time.Now().Unix())))
+func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte, adddata []byte) (int, error) {
+	if len(nownonce) != 16 {
+		nownonce = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(time.Now().Unix()+timeiv)...))
 	}
-	enddata, err := EncodeAesGCM(data, key, nownonce)
+	randomdatasizebyte := make([]byte, 1)
+	var err error
+	_, err = rand.Read(randomdatasizebyte)
+	if err != nil {
+		if isdebug {
+			log.Println("无法生成随机数据长度 , ", err.Error())
+		}
+		return 0, err
+	}
+	randombyte := make([]byte, uint8(randomdatasizebyte[0]))
+	_, err = rand.Read(randombyte)
+	if err != nil {
+		if isdebug {
+			log.Println("无法生成随机数据 , ", err.Error())
+		}
+		return 0, err
+	}
+	var enddata []byte
+	enddata, err = EncodeAesGCM(data, key, nownonce, adddata)
 	if err != nil {
 		return 0, err
 	}
-	datasize := pubpro.Int32ToBytes(int32(len(enddata)))
 	var n int
-	n, err = ento.Write(pubpro.ConnectBytes(datasize, enddata))
+	gooddata := append(append(append(randomdatasizebyte, randombyte...), pubpro.Int32ToBytes(int32(len(enddata)))...), enddata...)
+	//获得前面所有数据的CRC32
+	nowCRC32 := crc32.ChecksumIEEE(gooddata)
+	n, err = ento.Write(append(gooddata, pubpro.Int32ToBytes(int32(nowCRC32))...))
 	if err != nil {
 		return 0, err
 	}
@@ -86,7 +143,7 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte) (int, er
 }
 
 //AES GCM加密
-func EncodeAesGCM(data []byte, key []byte, adddata []byte) ([]byte, error) {
+func EncodeAesGCM(data []byte, key []byte, iv []byte, adddata []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, errors.New("EncodeAesGCM 新建AES加密器失败" + err.Error())
@@ -95,15 +152,10 @@ func EncodeAesGCM(data []byte, key []byte, adddata []byte) ([]byte, error) {
 	if err != nil {
 		return nil, errors.New("EncodeAesGCM 设置AES加密器IV Size失败" + err.Error())
 	}
-	var iv []byte
-	iv, err = Makenonce() //获取16位随机值
-	if err != nil {
-		return nil, errors.New("EncodeAesGCM 获取随机数据失败！" + err.Error())
-	}
-	return pubpro.ConnectBytes(iv, aesgcm.Seal(nil, iv, data, adddata)), nil //加密并合并加密数据，得到iv+data
+	return aesgcm.Seal(nil, iv, data, adddata), nil //得到data
 }
 
-func DecodeAesGCM(enddata []byte, key []byte, adddata []byte) ([]byte, error) {
+func DecodeAesGCM(enddata []byte, key []byte, iv []byte, adddata []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key) //生成加解密用的block
 	if err != nil {
 		return nil, errors.New("DecodeAesGCM 新建AES对象失败" + err.Error())
@@ -114,12 +166,9 @@ func DecodeAesGCM(enddata []byte, key []byte, adddata []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(enddata) <= aesgcm.NonceSize() { // 长度应该>iv
-		return nil, errors.New("AES数据太短！解密失败") //解密失败
-	}
 	var dedata []byte
-	//得到的密文格式是 iv + playload，所以分别传入IV,data，再加上add data就可以解密里
-	dedata, err = aesgcm.Open(nil, enddata[:aesgcm.NonceSize()], enddata[aesgcm.NonceSize():], adddata)
+	//得到的密文格式是data 通过初始IV可以解密
+	dedata, err = aesgcm.Open(nil, iv, enddata, adddata)
 	if err != nil {
 		return nil, errors.New("DecodeAesGCM 解密AES数据出错! " + err.Error())
 	}

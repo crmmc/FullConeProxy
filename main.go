@@ -15,7 +15,11 @@ import (
 	"./server"
 )
 
-var version string = "v1.2.6 Stable"
+//手写版本号
+var version string = "v1.2.7 Stable"
+
+//给密码生成加个salt
+var keysalt string = "UnKnownCharsetGBK"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -95,7 +99,10 @@ func main() {
 	if err != nil {
 		return
 	}
-	as.StartServer(*locallisten, astmp1[0])
+	err = as.StartServer(*locallisten, astmp1[0])
+	if err != nil {
+		return
+	}
 	as.StartLoop()
 }
 
@@ -106,14 +113,14 @@ func getkeybyte(keys string, loweraes bool) ([][]byte, error) {
 	var tmpkey []byte
 	for n, gkt := range serverkeys {
 		if loweraes {
-			tmpkey, err = mycrypto.Strtokey128(gkt) //生成密钥
+			tmpkey, err = mycrypto.Strtokey128(gkt + keysalt) //生成密钥
 			if err != nil {
 				log.Println("无法生成AES-128-GCM秘钥！ ", err.Error())
 				return returnkeys, err
 			}
 			returnkeys[n] = tmpkey
 		} else {
-			tmpkey, err = mycrypto.Strtokey256(gkt) //生成密钥
+			tmpkey, err = mycrypto.Strtokey256(gkt + keysalt) //生成密钥
 			if err != nil {
 				log.Println("无法生成AES-256-GCM秘钥！ ", err.Error())
 				return returnkeys, err

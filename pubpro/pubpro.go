@@ -39,12 +39,12 @@ func BytesToInt64(indata []byte) int64 {
 }
 
 func MD5toBytes(indata []byte) []byte {
-	bytebuff := bytes.NewBuffer(indata)
+	md5bytes := make([]byte, 0, 16)
 	md5data := md5.Sum(indata)
-	for i := 0; i < 15; i++ {
-		bytebuff.WriteByte(md5data[i])
+	for i := 0; i < 16; i++ {
+		md5bytes = append(md5bytes, md5data[i])
 	}
-	return bytebuff.Bytes()
+	return md5bytes
 }
 
 func UInt16ToBytes(n uint16) []byte {

@@ -3,16 +3,18 @@ package client
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
+	"strings"
 	"time"
 
 	"../mycrypto"
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 4
+var mybufsize int = 1024 * 2
 
 func (r *AClient) SetDebug(mode bool) {
 	r.IsDebug = mode
@@ -72,7 +74,11 @@ func (r *AClient) StartSocks5(socks5listenaddr string, serverconfig []ServerConf
 	}
 	defer socks5listener.Close()
 	for _, i := range serverconfig {
-		fmt.Printf("Client使用服务器地址： %s\n", i.ServerAddr.String())
+		fmt.Printf("Client使用服务器地址: [%s]", i.ServerAddr.String())
+		if r.IsDebug {
+			fmt.Printf(" 秘钥: |%x|", i.ServerKey)
+		}
+		fmt.Println()
 	}
 	r.serverconfig = serverconfig
 	for {
@@ -93,8 +99,8 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	buf := make([]byte, mybufsize) //读数据的buf
 	var n int
 	var err error
-	//一个SOCKS5握手怎么能超过10秒是吧，超过就废了它
-	socks5conn.SetReadDeadline(time.Now().Add(time.Duration(10) * time.Second))
+	//一个SOCKS5握手怎么能超过5秒是吧，超过就废了它
+	socks5conn.SetReadDeadline(time.Now().Add(time.Duration(5) * time.Second))
 	n, err = socks5conn.Read(buf)
 	// 只支持版本5
 	if err != nil || buf[0] != 0x05 {
@@ -121,7 +127,7 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	//指令接收到了,现在开始尝试连接至Server端
 	serverconn, key, err = r.ConnectToAServer()
 	if err != nil {
-		log.Println(err.Error())
+		log.Println("LOCAL 连接到SERVER失败: " + err.Error())
 		socks5conn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return false
 	}
@@ -153,17 +159,50 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	//处理好数据后,发送数据到服务器
 	//在加密函数那里写了若是附加数据为nil，则自动给包加(时间戳与key)的MD5作为附加数据，这样的话首包的安全性能得到更大保障
 	//解包使用类似V2的做法，可以允许LOCAL与SERVER时间相差正负两秒。
-	_, err = mycrypto.EncryptTo(pubpro.ConnectBytes(pubpro.ConnectBytes(nownonce, buf[1:2]), buf[3:n]), serverconn, key, nil)
-	if err != nil {
-		log.Println("LOCAL 发送指令到SERVER失败！ , ", err.Error())
-		return false
-	}
+	//为了防止对密文固定位置的ATYPE统计学攻击，给ADDRTYPE IPV4分配1到100的数字，IPV6分配100-254的数字，Domain分配255
+
 	switch buf[1] {
 	case 0x01:
 		// TCP CONNECT方法
 		fmt.Printf("SOCKS5: TCP CONNECT [%s]<=>[Local]<=>[%s][SERVER]\n", socks5conn.RemoteAddr().String(), serverconn.RemoteAddr().String())
 		//回复socks5接收连接
 		socks5conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		var randatype uint8
+		//取一个随机数
+		randatype = uint8(rand.Int())
+		switch buf[3] {
+		case 0x01:
+			//IPV4
+			for {
+				if randatype < 100 {
+					break
+				} else {
+					randatype = randatype - 100
+				}
+			}
+		case 0x03:
+			//Domain Name
+			randatype = 255
+		case 0x04:
+			//IPV6
+			for {
+				if randatype > 100 {
+					if randatype == 255 {
+						randatype = 254
+					}
+					break
+				} else {
+					randatype = randatype + 100
+				}
+			}
+		}
+		//发送首包到服务器
+		//客户端发过去的包的adddata都是 0XFF,0XFF
+		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), append([]byte{randatype}, buf[4:n]...)...), serverconn, key, nil, []byte{0xff, 0xff})
+		if err != nil {
+			log.Println("LOCAL 发送TCP指令到SERVER失败！ , ", err.Error())
+			return false
+		}
 		//开始处理TCP数据
 		return r.processtcp(socks5conn, serverconn, &key, &nownonce)
 	case 0x03:
@@ -211,6 +250,17 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		_, err = socks5conn.Write(append([]byte{0x05, 0x00, 0x00}, pubpro.AddrToBytes(myip, udpconn.LocalAddr().(*net.UDPAddr).Port)...))
 		if err != nil {
 			log.Println("LOCAL 无法回应SOCKS5的UDP请求!", err.Error())
+			return false
+		}
+		//UDP首包的地址数据无用，使用随机数据填充以混淆特征
+		tmpdata := make([]byte, uint8(rand.Int()))
+		_, err = rand.Read(tmpdata)
+		if err != nil {
+			log.Println("LOCAL 随机数生成失败，无法发送UDP指令到SERVER ", err.Error())
+		}
+		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), tmpdata...), serverconn, key, nil, []byte{0xff, 0xff})
+		if err != nil {
+			log.Println("LOCAL 发送TCP指令到SERVER失败！ , ", err.Error())
 			return false
 		}
 		return r.processudp(socks5conn, udpconn, clientudpaddr, serverconn, &key, &nownonce)
@@ -278,14 +328,14 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		for {
 			//从服务器接收到的数据包都是打包好的UDP数据包，到这里加上UDP头部的三字节
 			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
-			data, receerr = mycrypto.DecryptFrom(serverconn, *key, *nownonce)
+			data, receerr = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff})
 			if receerr != nil {
-				if r.IsDebug {
+				if r.IsDebug && receerr != io.EOF && !strings.Contains(receerr.Error(), "closed") {
 					log.Println("LOCAL 从服务器接收返回数据失败！ , ", receerr.Error())
 				}
 				break
 			}
-			data = pubpro.ConnectBytes([]byte{0x00, 0x00, 0x00}, data)
+			data = append([]byte{0x00, 0x00, 0x00}, data...)
 			udpconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 			n, receerr = udpconn.WriteToUDP(data, udpreturn)
 			if receerr != nil {
@@ -329,7 +379,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		udpconn.SetReadDeadline(time.Now().Add(time.Duration(r.udpLifeTime) * time.Second))
 		rdn, newudprecv, err = udpconn.ReadFromUDP(buf)
 		if err != nil {
-			if r.IsDebug {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				log.Println("LOCAL 从Socks5 UDP 读数据出错 , ", err.Error())
 			}
 			//UDP读出错，直接退出，结束SOCKS5连接
@@ -348,9 +398,9 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		}
 		serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 		//要去掉头部的三字节0,和服务器那边对应
-		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce)
+		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce, []byte{0xff, 0xff})
 		if err != nil {
-			if r.IsDebug {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				log.Println("SOCKS5 UDP打包数据加密失败,关闭连接 , ", err.Error())
 			}
 			break
@@ -383,9 +433,9 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 		var tmpwrite int
 		for {
 			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
-			fromserverdata, err2 = mycrypto.DecryptFrom(serverconn, *key, *nownonce)
+			fromserverdata, err2 = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff})
 			if err2 != nil {
-				if r.IsDebug {
+				if r.IsDebug && err2 != io.EOF && !strings.Contains(err2.Error(), "closed") {
 					log.Println("Local: 解密来自SERVER的数据失败 , ", err2.Error())
 				}
 				break
@@ -393,7 +443,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 			//fmt.Printf("LOCAL 从服务器接收数据：|%x|->|%d|\n", fromserverdata, len(fromserverdata))
 			socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
 			tmpwrite, err2 = socks5conn.Write(fromserverdata)
-			if err2 != nil {
+			if err2 != nil && err2 != io.EOF && !strings.Contains(err2.Error(), "closed") {
 				if r.IsDebug {
 					log.Println("LOCAL: 写入数据到SOCKS5失败 , ", err2.Error())
 				}
@@ -413,14 +463,14 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 	for {
 		socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
 		if ln, err = socks5conn.Read(buf); err != nil {
-			if r.IsDebug {
+			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "closed") {
 				log.Println("LOCAL 从SOCKS5读取TCP数据失败 , ", err.Error())
 			}
 			break
 		} else {
 			//fmt.Printf("LOCAL 发送数据：|%x|->|%d|\n", buf[:ln], ln)
 			serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
-			_, err = mycrypto.EncryptTo(buf[:ln], serverconn, *key, *nownonce)
+			_, err = mycrypto.EncryptTo(buf[:ln], serverconn, *key, *nownonce, []byte{0xff, 0xff})
 			if err != nil {
 				if r.IsDebug {
 					log.Println("LOCAL: TCP数据发送到SERVER失败! , ", err.Error())
