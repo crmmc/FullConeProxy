@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"../mycrypto"
@@ -15,11 +16,18 @@ import (
 
 var mybufsize int = 1024 * 2
 
-//清理随机数黑名单的时间，每15秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
+//全局的Nonce记录，这个用来检测重放,存放在有效期内已存在的IV
+var noncerecord map[[16]byte]int64
+
+//nonce记录的操作锁
+var noncerecordlock sync.Mutex = sync.Mutex{}
+
+//IV最久保持10秒就过期,这个一定要不短于mycrypto中的时间误差允许范围
+var maxrecordtime int64 = 10
+
+//清理IV黑名单的时间，每15秒检查一次，合理设置能减轻随机数表大小且不过分耗费性能
 var checktime int = 15
 
-//全局的Nonce记录，这个用来检测重放,自己写的一个FIFO队列
-var noncerecord pubpro.Queue = pubpro.Queue{}
 var checkerrunning = false
 var fuckattacker = false
 
@@ -59,67 +67,70 @@ func ModeFuckAttacker(mode bool) {
 }
 
 //单独写Hangon，这样的话就可以让Go释放原来占用的内存空间，只剩下本次连接用的内存空间
-func HangOnConnect(hangedconn *net.TCPConn) {
+func HangOnConnect(hangedconn *net.TCPConn, tcpreadtimeout int) {
 	defer hangedconn.Close()
-	log.Printf("SERVER 来自[%s]的连接被重放处理挂起", hangedconn.RemoteAddr().String())
+	log.Printf("SERVER 来自[%s]的重放连接被挂起", hangedconn.RemoteAddr().String())
 	if fuckattacker {
-		log.Printf("SERVER决定惩罚发起重放的服务器 [%s]\n", hangedconn.RemoteAddr().String())
-		hangedconn.SetWriteDeadline(time.Now().Add(time.Duration(5) * time.Second))
-		randomdata := make([]byte, 64)
+		log.Printf("SERVER决定惩罚发起重放连接的服务器 [%s]\n", hangedconn.RemoteAddr().String())
+		//做事不要做得太过，省点流量，一直发送30秒顶天了
+		hangedconn.SetWriteDeadline(time.Now().Add(time.Duration(30) * time.Second))
 		go func() {
 			var allsenddata int
 			var errord error
 			var rdn int
 			for {
+				//要新申请的变量才能保证真随机
+				randomdata := make([]byte, 64)
 				rand.Read(randomdata)
-				rdn, errord = hangedconn.Write(append([]byte("EAT MY SHIT"), randomdata...))
+				rdn, errord = hangedconn.Write(randomdata)
 				if errord != nil {
 					break
 				}
 				allsenddata = allsenddata + rdn
 			}
-			log.Printf("SERVER 惩罚发起重放的服务器 [%s] 结束，总共发送了垃圾数据: [%s]\n", hangedconn.RemoteAddr().String(), pubpro.ReadableBytes(allsenddata))
+			log.Printf("SERVER 惩罚发起重放连接的服务器 [%s] 结束，总共发送了垃圾数据: [%s]\n", hangedconn.RemoteAddr().String(), pubpro.ReadableBytes(allsenddata))
 		}()
 	}
 	buf := make([]byte, 10)
 	var err error
 	var rdn int
-	//更新读超时时间点，最多120秒没有数据写入就关闭连接
-	hangedconn.SetReadDeadline(time.Now().Add(time.Duration(10) * time.Second))
+	starttime := time.Now().Unix()
+	//设置读超时时间点,保证超时时间和正常一致
+	hangedconn.SetReadDeadline(time.Now().Add(time.Duration(tcpreadtimeout) * time.Second))
 	for {
 		rdn, err = hangedconn.Read(buf)
 		if err != nil {
-			log.Printf("SERVER 重放连接[%s] 结束! [%s]\n", hangedconn.RemoteAddr().String(), err.Error())
+			log.Printf("SERVER 重放连接[%s]结束! 持续时间[%d秒] ERROR:[%s]\n", hangedconn.RemoteAddr().String(), time.Now().Unix()-starttime, err.Error())
 			return
 		}
 		log.Printf("来自[%s]的重放数据: |%x| %s\n", hangedconn.RemoteAddr().String(), buf[:rdn], pubpro.ReadableBytes(rdn))
 	}
 }
 
+//noncerecord统计员
 func noncenum() {
 	for {
-		fmt.Println("Nonce废纸篓数量:", noncerecord.Size())
+		fmt.Println("Nonce废纸篓数量:", len(noncerecord))
 		time.Sleep(time.Duration(2) * time.Second)
 	}
 }
 
+//noncerecord清理卫士
 func noncechecker() {
+	mycrypto.SetMaxAllowTimeError(maxrecordtime)
 	for {
-		var a *int64
-		_, a = noncerecord.GetFirst()
-		if a == nil {
-			break
+		nowtime := time.Now().Unix()
+		//遍历key，过期的IV记录
+		noncerecordlock.Lock()
+		for m := range noncerecord {
+			if noncerecord[m]-nowtime > maxrecordtime {
+				delete(noncerecord, m)
+			}
 		}
-		if (*a - time.Now().Unix()) > 0 {
-			break
-		}
-		//FIFO队列，每次操作删除第一个,好处是每次只用检查最先加入的一个，第一个没有超时，后面的每一个元素都不可能超时
-		//所以可以直接停止检测，而第一个超时那就检查第二个，直到检查到有没有超时的对象或者全部检查完为止
-		//采用仅写时加锁（乐观锁），感觉有可能出问题，但是不想放弃这一点点效率
-		noncerecord.Del()
+		noncerecordlock.Unlock()
+		//太过频繁的轮询消耗机器资源
+		time.Sleep(time.Duration(checktime) * time.Second)
 	}
-	//太过频繁的轮询消耗机器资源
-	time.Sleep(time.Duration(checktime) * time.Second)
 }
 
 func (r *AServer) SetDebug(id bool) {
@@ -246,15 +257,20 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 
 	//分离出的随机数
 	r.nonce = dedata[0:16]
-	if noncerecord.Exist(r.nonce) {
+	//用于检测的随机数的copy,golang中切片和数组不是同一类，要复制一个数组副本用
+	var pdnonce [16]byte
+	copy(pdnonce[:], dedata[0:16])
+	if _, ok := noncerecord[pdnonce]; ok {
 		log.Println("遭到重放攻击！！ 启用应对措施： 挂起连接")
 		log.Printf("来自： %s 的重放数据包 |%x| ,%s", r.connfromclient.RemoteAddr().String(), dedata, pubpro.ReadableBytes(len(dedata)))
 		//挂起连接，但是防止process退出导致process的自动关闭连接触发
 		r.connfromclient = nil
-		go HangOnConnect(sconn.(*net.TCPConn))
+		go HangOnConnect(sconn.(*net.TCPConn), *r.TcpReadTimeout)
 		return false
 	} else {
-		noncerecord.Add(r.nonce)
+		noncerecordlock.Lock()
+		noncerecord[pdnonce] = time.Now().Unix()
+		noncerecordlock.Unlock()
 	}
 	if *r.Isdebug {
 		fmt.Printf("SERVER 收到随机数 nonce: %x\n", r.nonce)

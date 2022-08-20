@@ -15,10 +15,10 @@ import (
 )
 
 //手写版本号
-var version string = "v1.2.9 Bate"
+var version string = "v1.3.0 Stanle"
 
 //给密码生成加个salt
-var keysalt string = "HAHA1.2.9"
+var keysalt string = "emmmmHAHA"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -50,11 +50,14 @@ func main() {
 		}
 		f.Close()
 	}
+	//在这里DIY你的独特配置
+	mycrypto.SetTimestmpDelay(1413251)
+	keysalt = "Hehahahaha"
+	//DIY你的独特配置
 	mycrypto.SetDebug(*ondebug)
 	server.ModeFuckAttacker(*doyoufuckit)
 	var err error
 	var sconfig []client.ServerConfig
-
 	if *runningmode || *ontest {
 		serveraddrstrings := strings.Split(*remoteaddr, ",")
 		if len(serveraddrstrings) < 1 {

@@ -24,6 +24,15 @@ func SetDebug(mode bool) {
 	isdebug = mode
 }
 
+//设置时间戳的偏移量
+func SetTimestmpDelay(delay int64) {
+	timeiv = delay
+}
+
+func SetMaxAllowTimeError(settime int64) {
+	maxallowtimeerror = settime
+}
+
 func Strtokey128(str string) ([]byte, error) {
 	return hex.DecodeString(fmt.Sprintf("%x", md5.Sum([]byte(str))))
 }

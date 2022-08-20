@@ -3,6 +3,7 @@ package pubpro
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,7 +15,7 @@ import (
 
 func Int32ToBytes(inn int32) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, inn)
+	binary.Write(bytebuf, binary.BigEndian, &inn)
 	return bytebuf.Bytes()
 }
 
@@ -27,7 +28,7 @@ func BytesToInt32(bys []byte) int32 {
 
 func Int64toBytes(innum int64) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, innum)
+	binary.Write(bytebuf, binary.BigEndian, &innum)
 	return bytebuf.Bytes()
 }
 
@@ -41,20 +42,30 @@ func BytesToInt64(indata []byte) int64 {
 func MD5toBytes(indata []byte) []byte {
 	md5bytes := make([]byte, 0, 16)
 	md5data := md5.Sum(indata)
-	for i := 0; i < 16; i++ {
-		md5bytes = append(md5bytes, md5data[i])
-	}
+	copy(md5data[:], md5bytes)
 	return md5bytes
 }
 
 func UInt16ToBytes(n uint16) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, n)
+	binary.Write(bytebuf, binary.BigEndian, &n)
 	return bytebuf.Bytes()
 }
 
 func BytesTouInt16(bys []byte) int {
 	return int(binary.BigEndian.Uint16(bys))
+}
+
+func GetRandInt32() int32 {
+	var intbyte int32
+	binary.Read(rand.Reader, binary.BigEndian, &intbyte)
+	return intbyte
+}
+
+func GetRanduInt8() uint8 {
+	var reint uint8
+	binary.Read(rand.Reader, binary.BigEndian, &reint)
+	return reint
 }
 
 func ReadableBytes(rb int) string {

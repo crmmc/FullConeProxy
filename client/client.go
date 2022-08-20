@@ -1,11 +1,12 @@
 package client
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	mrand "math/rand"
 	"net"
 	"strings"
 	"time"
@@ -167,38 +168,9 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		fmt.Printf("SOCKS5: TCP CONNECT [%s]<=>[Local]<=>[%s][SERVER]\n", socks5conn.RemoteAddr().String(), serverconn.RemoteAddr().String())
 		//回复socks5接收连接
 		socks5conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		var randatype uint8
-		//取一个随机数
-		randatype = uint8(rand.Int())
-		switch buf[3] {
-		case 0x01:
-			//IPV4
-			for {
-				if randatype < 100 {
-					break
-				} else {
-					randatype = randatype - 100
-				}
-			}
-		case 0x03:
-			//Domain Name
-			randatype = 255
-		case 0x04:
-			//IPV6
-			for {
-				if randatype > 100 {
-					if randatype == 255 {
-						randatype = 254
-					}
-					break
-				} else {
-					randatype = randatype + 100
-				}
-			}
-		}
 		//发送首包到服务器
 		//客户端发过去的包的adddata都是 0XFF,0XFF
-		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), append([]byte{randatype}, buf[4:n]...)...), serverconn, key, nil, []byte{0xff, 0xff})
+		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), buf[3:n]...), serverconn, key, nil, []byte{0xff, 0xff})
 		if err != nil {
 			log.Println("LOCAL 发送TCP指令到SERVER失败！ , ", err.Error())
 			return false
@@ -253,8 +225,8 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 			return false
 		}
 		//UDP首包的地址数据无用，使用随机数据填充以混淆特征
-		tmpdata := make([]byte, uint8(rand.Int()))
-		_, err = rand.Read(tmpdata)
+		tmpdata := make([]byte, pubpro.GetRanduInt8())
+		_, err = crand.Read(tmpdata)
 		if err != nil {
 			log.Println("LOCAL 随机数生成失败，无法发送UDP指令到SERVER ", err.Error())
 		}
@@ -280,8 +252,8 @@ func (r *AClient) ConnectToAServer() (*net.TCPConn, []byte, error) {
 	var err error
 	//若是开启随机选择服务器，那就把服务器数组打乱
 	if r.ServerChoiceRandom && len(r.serverconfig) > 1 {
-		rand.Seed(time.Now().Unix())
-		rand.Shuffle(len(r.serverconfig), func(i int, j int) {
+		mrand.Seed(time.Now().Unix())
+		mrand.Shuffle(len(r.serverconfig), func(i int, j int) {
 			r.serverconfig[i], r.serverconfig[j] = r.serverconfig[j], r.serverconfig[i]
 		})
 	}
