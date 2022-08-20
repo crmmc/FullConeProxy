@@ -15,7 +15,7 @@ import (
 
 func Int32ToBytes(inn int32) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, &inn)
+	binary.Write(bytebuf, binary.BigEndian, inn)
 	return bytebuf.Bytes()
 }
 
@@ -28,7 +28,7 @@ func BytesToInt32(bys []byte) int32 {
 
 func Int64toBytes(innum int64) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, &innum)
+	binary.Write(bytebuf, binary.BigEndian, innum)
 	return bytebuf.Bytes()
 }
 
@@ -40,15 +40,15 @@ func BytesToInt64(indata []byte) int64 {
 }
 
 func MD5toBytes(indata []byte) []byte {
-	md5bytes := make([]byte, 0, 16)
+	md5bytes := make([]byte, 16)
 	md5data := md5.Sum(indata)
-	copy(md5data[:], md5bytes)
+	copy(md5bytes, md5data[:])
 	return md5bytes
 }
 
 func UInt16ToBytes(n uint16) []byte {
 	bytebuf := bytes.NewBuffer([]byte{})
-	binary.Write(bytebuf, binary.BigEndian, &n)
+	binary.Write(bytebuf, binary.BigEndian, n)
 	return bytebuf.Bytes()
 }
 

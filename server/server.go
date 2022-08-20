@@ -50,6 +50,7 @@ func (r *AServer) Init() {
 	r.udpLifeTime = 60
 	r.tcpNODELAY = true
 	r.Isdebug = false
+	noncerecord = make(map[[16]byte]int64)
 	//启动这个全局检查的goruntime，启动一遍就够了
 	if !checkerrunning {
 		if r.Isdebug {
@@ -260,6 +261,8 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	//用于检测的随机数的copy,golang中切片和数组不是同一类，要复制一个数组副本用
 	var pdnonce [16]byte
 	copy(pdnonce[:], dedata[0:16])
+	//map线程不安全读写都要加锁
+	noncerecordlock.Lock()
 	if _, ok := noncerecord[pdnonce]; ok {
 		log.Println("遭到重放攻击！！ 启用应对措施： 挂起连接")
 		log.Printf("来自： %s 的重放数据包 |%x| ,%s", r.connfromclient.RemoteAddr().String(), dedata, pubpro.ReadableBytes(len(dedata)))
@@ -268,27 +271,15 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 		go HangOnConnect(sconn.(*net.TCPConn), *r.TcpReadTimeout)
 		return false
 	} else {
-		noncerecordlock.Lock()
 		noncerecord[pdnonce] = time.Now().Unix()
-		noncerecordlock.Unlock()
 	}
+	noncerecordlock.Unlock()
 	if *r.Isdebug {
 		fmt.Printf("SERVER 收到随机数 nonce: %x\n", r.nonce)
 	}
 	// TCP Method X'01'
 	// UDP Method X'03'
 	if dedata[16] == 0x01 {
-		//还原得到的目标地址
-		if dedata[17] == 255 {
-			//DomainName
-			dedata[17] = 0x03
-		} else if dedata[17] > 100 {
-			//IPV6
-			dedata[17] = 0x04
-		} else {
-			//IPV4
-			dedata[17] = 0x01
-		}
 		dstAddr := pubpro.BytesToTcpAddr(dedata[17:n])
 		if dstAddr == nil {
 			if *r.Isdebug {
