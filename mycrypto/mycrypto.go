@@ -54,7 +54,9 @@ func Makenonce() ([]byte, error) {
 +------------------+-----------+--------+
 */
 
-func DecryptFrom(sconn net.Conn, key []byte, nownonce []byte, adddata []byte) ([]byte, error) {
+//如果被主动探测，遭到逐字节探测或被恶意修改的包重放，应该提示并记录内容，但是它发送的被修改的数据一定会解密失败
+//但是与错误的版本和密码导致的数据解密失败分不开，这该如何是好，还是保持原来的反应吧
+func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte, error) {
 	var numsizebyte []byte
 	var err error
 	numsizebyte, err = pubpro.ReadbytesFrom(sconn, 4)
@@ -67,33 +69,33 @@ func DecryptFrom(sconn net.Conn, key []byte, nownonce []byte, adddata []byte) ([
 	if err != nil {
 		return nil, errors.New("无法收到加密数据 " + err.Error())
 	}
-	if nownonce == nil {
+	if len(iv) != 16 {
 		//这里给获取的时间戳做一个独特的运算，防止密码被知道后，通过被记录的包发送时间运算出包的内容
 		//偏移量改那个全局变量
 		//借用前面的变量datasize储存timestmp
 		datasize = time.Now().Unix() + timeiv
 		var ddata []byte
 		for tmpsize := maxallowtimeerror * int64(-1); tmpsize < maxallowtimeerror; tmpsize++ {
-			nownonce = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(datasize+tmpsize)...))
-			ddata, err = DecodeAesGCM(enddata, key, nownonce, adddata)
+			iv = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(datasize+tmpsize)...))
+			ddata, err = DecodeAesGCM(enddata, key, iv, adddata)
 			if err == nil {
 				//去掉填充用的随机数据
 				return ddata[uint8(ddata[0])+1:], nil
 			}
 		}
 	} else {
-		enddata, err = DecodeAesGCM(enddata, key, nownonce, adddata)
+		enddata, err = DecodeAesGCM(enddata, key, iv, adddata)
 		if err == nil {
 			//去掉填充用的随机数据
 			return enddata[uint8(enddata[0])+1:], nil
 		}
 	}
-	return nil, err
+	return nil, errors.New("来自[" + sconn.RemoteAddr().String() + "]的加密数据解密失败，可能是错误的密码，不同步的系统时间，亦或是正在遭到主动探测攻击导致的错误发生 " + err.Error())
 }
 
-func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte, adddata []byte) (int, error) {
-	if len(nownonce) != 16 {
-		nownonce = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(time.Now().Unix()+timeiv)...))
+func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte) (int, error) {
+	if len(iv) != 16 {
+		iv = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(time.Now().Unix()+timeiv)...))
 	}
 	randomdatasizebyte := make([]byte, 1)
 	var err error
@@ -121,7 +123,7 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, nownonce []byte, adddata 
 	}
 	var enddata []byte
 	data = append(append(randomdatasizebyte, randombyte...), data...)
-	enddata, err = EncodeAesGCM(data, key, nownonce, adddata)
+	enddata, err = EncodeAesGCM(data, key, iv, adddata)
 	if err != nil {
 		return 0, err
 	}
