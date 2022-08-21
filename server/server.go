@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +13,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 2
+var mybufsize int = 1024 * 4
 
 //全局的Nonce记录，这个用来检测重放,存放在有效期内已存在的IV
 var noncerecord map[[16]byte]int64
@@ -29,7 +28,6 @@ var maxrecordtime int64 = 10
 var checktime int = 15
 
 var checkerrunning = false
-var fuckattacker = false
 
 //一个Server
 type AServer struct {
@@ -61,37 +59,10 @@ func (r *AServer) Init() {
 	}
 }
 
-//开启这个后，会对重放者发动反击，对其不断地，满带宽的发送随机数据
-//相当于同归于尽，会大量消耗服务器流量，会不会因为这个被封呢
-func ModeFuckAttacker(mode bool) {
-	fuckattacker = mode
-}
-
 //单独写Hangon，这样的话就可以让Go释放原来占用的内存空间，只剩下本次连接用的内存空间
 func HangOnConnect(hangedconn *net.TCPConn, tcpreadtimeout int) {
 	defer hangedconn.Close()
 	log.Printf("SERVER 来自[%s]的重放连接被挂起", hangedconn.RemoteAddr().String())
-	if fuckattacker {
-		log.Printf("SERVER决定惩罚发起重放连接的服务器 [%s]\n", hangedconn.RemoteAddr().String())
-		//做事不要做得太过，省点流量，一直发送30秒顶天了
-		hangedconn.SetWriteDeadline(time.Now().Add(time.Duration(30) * time.Second))
-		go func() {
-			var allsenddata int
-			var errord error
-			var rdn int
-			for {
-				//要新申请的变量才能保证真随机
-				randomdata := make([]byte, 64)
-				rand.Read(randomdata)
-				rdn, errord = hangedconn.Write(randomdata)
-				if errord != nil {
-					break
-				}
-				allsenddata = allsenddata + rdn
-			}
-			log.Printf("SERVER 惩罚发起重放连接的服务器 [%s] 结束，总共发送了垃圾数据: [%s]\n", hangedconn.RemoteAddr().String(), pubpro.ReadableBytes(allsenddata))
-		}()
-	}
 	buf := make([]byte, 10)
 	var err error
 	var rdn int
@@ -264,11 +235,12 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	//map线程不安全读写都要加锁
 	noncerecordlock.Lock()
 	if _, ok := noncerecord[pdnonce]; ok {
-		log.Println("遭到重放攻击！！ 启用应对措施： 挂起连接")
+		log.Println("遭到重放攻击！！ 启用应对措施： 直接重置连接")
 		log.Printf("来自： %s 的重放数据包 |%x| ,%s", r.connfromclient.RemoteAddr().String(), dedata, pubpro.ReadableBytes(len(dedata)))
 		//挂起连接，但是防止process退出导致process的自动关闭连接触发
-		r.connfromclient = nil
-		go HangOnConnect(sconn.(*net.TCPConn), *r.TcpReadTimeout)
+		//r.connfromclient = nil
+		//go HangOnConnect(sconn.(*net.TCPConn), *r.TcpReadTimeout)
+		//统一特征
 		return false
 	} else {
 		noncerecord[pdnonce] = time.Now().Unix()

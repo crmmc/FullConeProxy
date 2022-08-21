@@ -15,7 +15,7 @@ import (
 	"../pubpro"
 )
 
-var mybufsize int = 1024 * 2
+var mybufsize int = 1024 * 4
 
 func (r *AClient) SetDebug(mode bool) {
 	r.IsDebug = mode
@@ -134,9 +134,6 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	}
 	serverconn.SetLinger(0)             //与server端的连接需要关闭时立即断开连接
 	serverconn.SetNoDelay(r.tcpNODELAY) //与server端的连接需要开启TCP NO DELAY标志
-	//与server端的连接需要设置 读/写 最大超时时间
-	serverconn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
-	serverconn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpWriteTimeout)))
 	//保证此进程退出的时候,建立的连接得到释放
 	defer serverconn.Close()
 	//由客户端生成一个长16字节的随机数,之后将作为协议加密时的AES GCM加密方式 附加验证数据使用
@@ -433,7 +430,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 	var err error
 	//临时的从SOCKS5接收到的数据大小
 	for {
-		socks5conn.SetWriteDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
+		socks5conn.SetReadDeadline(time.Now().Add(time.Second * time.Duration(r.tcpReadTimeout)))
 		if ln, err = socks5conn.Read(buf); err != nil {
 			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "reset") {
 				log.Println("LOCAL 从SOCKS5读取TCP数据失败 , ", err.Error())

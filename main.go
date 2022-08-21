@@ -15,10 +15,10 @@ import (
 )
 
 //手写版本号
-var version string = "v1.3.0 Stanle"
+var version string = "v1.3.2 Stable"
 
-//给密码生成加个salt
-var keysalt string = "emmmmHAHA"
+//给密码生成加个salt,要修改不要改这里不生效，往下面改MAIN函数里的
+var keysalt string = "TooSlot"
 
 func main() {
 	fmt.Println("FullConeProxy \nAn Private Proxy Tool \nversion:", version)
@@ -33,7 +33,6 @@ func main() {
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
 	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
 	loweraes := flag.Bool("lower", false, "Use lower security encryption methods(AES-128-GCM) instead of AES-256-GCM , This option will affect the encryption of all passwords. When using multiple servers, please note that the password encryption mode used by each server cannot be customized")
-	doyoufuckit := flag.Bool("fuck", false, "Switch up will enable Attack to the replay server")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
 	if *showhelp {
@@ -51,11 +50,10 @@ func main() {
 		f.Close()
 	}
 	//在这里DIY你的独特配置
-	mycrypto.SetTimestmpDelay(1413251)
-	keysalt = "Hehahahaha"
+	mycrypto.SetTimestmpDelay(-114514)
+	keysalt = "Kaka"
 	//DIY你的独特配置
 	mycrypto.SetDebug(*ondebug)
-	server.ModeFuckAttacker(*doyoufuckit)
 	var err error
 	var sconfig []client.ServerConfig
 	if *runningmode || *ontest {

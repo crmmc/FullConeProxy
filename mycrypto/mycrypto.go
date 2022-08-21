@@ -122,6 +122,9 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte
 	if randomdatasizebyte[0] > 100 {
 		randomdatasizebyte[0] = randomdatasizebyte[0] - 100
 	}
+	if randomdatasizebyte[0] < 10 {
+		randomdatasizebyte[0] = randomdatasizebyte[0] * 2
+	}
 	randombyte := make([]byte, uint8(randomdatasizebyte[0]))
 	_, err = rand.Read(randombyte)
 	if err != nil {
