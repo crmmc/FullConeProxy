@@ -1,6 +1,8 @@
 package mycrypto
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
@@ -19,9 +21,14 @@ import (
 var isdebug bool = true
 var maxallowtimeerror int64 = 10 //最大允许收发数据包的两端时间相差10秒
 var timeiv int64 = -404          //时间戳的偏移量，防止被记录包发送时间后用密码解出包的内容，其实这一点应该随机生成更好
-
+var enablegzip bool = false      //是否开启压缩GZIP数据
 func SetDebug(mode bool) {
 	isdebug = mode
+}
+
+//是否开启GZIP压缩数据
+func SetEnableGzip(mode bool) {
+	enablegzip = mode
 }
 
 //设置时间戳的偏移量
@@ -65,6 +72,8 @@ func Makenonce() ([]byte, error) {
 
 //如果被主动探测，遭到逐字节探测或被恶意修改的包重放，应该提示并记录内容，但是它发送的被修改的数据一定会解密失败
 //但是与错误的版本和密码导致的数据解密失败分不开，这该如何是好，还是保持原来的反应吧
+
+//用于接收私有协议加密数据的函数
 func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte, error) {
 	var numsizebyte []byte
 	var err error
@@ -89,19 +98,30 @@ func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte,
 			ddata, err = DecodeAesGCM(enddata, key, iv, adddata)
 			if err == nil {
 				//去掉填充用的随机数据
-				return ddata[uint8(ddata[0])+1:], nil
+				if enablegzip {
+					//gzip只压缩了有效数据，所以在此解密
+					return gzdecompress(ddata[uint8(ddata[0])+1:])
+				} else {
+					return ddata[uint8(ddata[0])+1:], nil
+				}
 			}
 		}
 	} else {
 		enddata, err = DecodeAesGCM(enddata, key, iv, adddata)
 		if err == nil {
 			//去掉填充用的随机数据
-			return enddata[uint8(enddata[0])+1:], nil
+			if enablegzip {
+				//gzip只压缩了有效数据，所以在此解密
+				return gzdecompress(enddata[uint8(enddata[0])+1:])
+			} else {
+				return enddata[uint8(enddata[0])+1:], nil
+			}
 		}
 	}
 	return nil, errors.New("来自[" + sconn.RemoteAddr().String() + "]的加密数据解密失败，可能是错误的密码，不同步的系统时间，亦或是正在遭到主动探测攻击导致的错误发生 " + err.Error())
 }
 
+//用于发送私有协议加密数据的函数
 func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte) (int, error) {
 	if len(iv) != 16 {
 		iv = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(time.Now().Unix()+timeiv)...))
@@ -132,6 +152,13 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte
 			log.Println("无法生成随机数据 , ", err.Error())
 		}
 		return 0, err
+	}
+	if enablegzip {
+		//开启了GZIP压缩，只压缩data部分
+		data, err = gzcompress(data)
+		if err != nil {
+			return 0, err
+		}
 	}
 	var enddata []byte
 	data = append(append(randomdatasizebyte, randombyte...), data...)
@@ -174,4 +201,33 @@ func DecodeAesGCM(enddata []byte, key []byte, iv []byte, adddata []byte) ([]byte
 		return nil, errors.New("DecodeAesGCM 解密AES数据出错! " + err.Error())
 	}
 	return dedata, err
+}
+
+func gzcompress(indata []byte) ([]byte, error) {
+	var b bytes.Buffer
+	gz := gzip.NewWriter(&b)
+	if _, err := gz.Write(indata); err != nil {
+		return nil, errors.New("GZIP Compress Failed " + err.Error())
+	}
+	if err := gz.Flush(); err != nil {
+		return nil, errors.New("GZIP Flush Failed " + err.Error())
+	}
+	if err := gz.Close(); err != nil {
+		return nil, errors.New("GZIP Close Failed " + err.Error())
+	}
+	return b.Bytes(), nil
+}
+
+func gzdecompress(indata []byte) ([]byte, error) {
+	rdata := bytes.NewReader(indata)
+	gz, err := gzip.NewReader(rdata)
+	if err != nil {
+		return nil, errors.New("Decompress gzip data failed! " + err.Error())
+	}
+	var buf bytes.Buffer
+	// 从 Reader 中读取出数据
+	if _, err := buf.ReadFrom(gz); err != nil {
+		return nil, errors.New("Read Data From gzip decompress buffer failed! " + err.Error())
+	}
+	return buf.Bytes(), nil
 }
