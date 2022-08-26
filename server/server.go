@@ -45,7 +45,7 @@ func (r *AServer) Init() {
 	r.keybyte = nil
 	r.tcpReadTimeout = 60
 	r.tcpWriteTimeout = 15
-	r.udpLifeTime = 60
+	r.udpLifeTime = 120
 	r.tcpNODELAY = true
 	r.Isdebug = false
 	noncerecord = make(map[[16]byte]int64)

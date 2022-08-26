@@ -32,10 +32,10 @@ func (r *AClient) SetUDPLifeTime(timeout int) {
 }
 
 type ServerConfig struct {
-	ServerAddr      net.TCPAddr
-	ServerKey       []byte
-	ServerFaildTime int8  //记录服务器连接失败的次数，这样的话失败的次数过多就可以一定时间禁用这个服务器了
-	ServerBanUntil  int64 //记录服务器被禁用解封的时间
+	ServerAddr           net.TCPAddr
+	ServerKey            []byte
+	ServerFaildTime      int8  //记录服务器连接失败的次数，这样的话失败的次数过多就可以一定时间禁用这个服务器了
+	ServerLastFailedTime int64 //记录服务器被禁用解封的时间
 }
 
 //不要在这里的Timeout使用time。Time，因为这样的话全部用的都是指向一块内存地址的Time。time，而这个对象在到达指定时间之后就会
@@ -53,7 +53,7 @@ type AClient struct {
 func (r *AClient) Init() {
 	r.tcpReadTimeout = 60
 	r.tcpWriteTimeout = 15
-	r.udpLifeTime = 60
+	r.udpLifeTime = 120
 	r.tcpNODELAY = true
 	r.IsDebug = false
 	r.ServerChoiceRandom = true
@@ -256,26 +256,26 @@ func (r *AClient) ConnectToAServer() (*net.TCPConn, []byte, error) {
 			r.serverconfig[i], r.serverconfig[j] = r.serverconfig[j], r.serverconfig[i]
 		})
 	}
-	for _, i := range r.serverconfig {
-		//若是服务器还在禁用时间内就跳过
-		if i.ServerBanUntil > time.Now().Unix() {
-			log.Printf("Local: --X->[%s][SERVER] Server Be Baned, Ignore it\n", i.ServerAddr.IP)
+	for surint := range r.serverconfig {
+		//若最后一次失败的时间到现在超过30秒里，那就解放服务器，重置失败次数
+		if r.serverconfig[surint].ServerLastFailedTime-time.Now().Unix() > 30 {
+			r.serverconfig[surint].ServerFaildTime = 0
+			log.Printf("Local: --X->[%s][SERVER] Server Release\n", r.serverconfig[surint].ServerAddr.IP)
+		}
+		//30秒内失败3次就算寄
+		if r.serverconfig[surint].ServerFaildTime > 2 {
+			log.Printf("Local: --X->[%s][SERVER] Server Connect Failed Too Many Time, Disable it for 30 second!\n", r.serverconfig[surint].ServerAddr.IP)
 			continue
 		}
-		//失败次数超过三次就禁用30秒
-		if i.ServerFaildTime > 2 {
-			log.Printf("Local: --X->[%s][SERVER] Server Connect Failed Too Many Time, Disable it for 30 second!\n", i.ServerAddr.IP)
-			i.ServerBanUntil = time.Now().Add(time.Duration(30) * time.Second).Unix()
-			i.ServerFaildTime = 0
-		}
 		//连接服务器的超时保持,2秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
-		a, err = net.DialTimeout("tcp", i.ServerAddr.String(), time.Duration(2)*time.Second)
+		a, err = net.DialTimeout("tcp", r.serverconfig[surint].ServerAddr.String(), time.Duration(2)*time.Second)
 		if err == nil {
-			return a.(*net.TCPConn), i.ServerKey, err
+			return a.(*net.TCPConn), r.serverconfig[surint].ServerKey, err
 		}
 		//连接服务器失败算一个重要的信息，不能忽略
-		log.Printf("Local: --X->[%s][SERVER] Server Connect Failed!\n", i.ServerAddr.IP)
-		i.ServerFaildTime++ //递增失败次数，过多就禁用这个服务器
+		log.Printf("Local: --X->[%s][SERVER] Server Connect Failed! Times:%d\n", r.serverconfig[surint].ServerAddr.IP, r.serverconfig[surint].ServerFaildTime)
+		r.serverconfig[surint].ServerFaildTime++ //递增失败次数，过多就禁用这个服务器
+		r.serverconfig[surint].ServerLastFailedTime = time.Now().Unix()
 	}
 	return nil, nil, errors.New("无可用的服务器以供选择")
 }

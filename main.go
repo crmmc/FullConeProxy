@@ -51,8 +51,8 @@ func main() {
 		f.Close()
 	}
 	//在这里DIY你的独特配置
-	mycrypto.SetTimestmpDelay(-1131)
-	keysalt = "AkknonoOO"
+	mycrypto.SetTimestmpDelay(-111)
+	keysalt = "Ak"
 	//DIY你的独特配置
 	mycrypto.SetDebug(*ondebug)
 	mycrypto.SetEnableGzip(*ongzip)
@@ -77,7 +77,7 @@ func main() {
 			a, err := net.ResolveTCPAddr("tcp", cstr)
 			if err == nil {
 				//将配置文件添加进数组
-				sconfig = append(sconfig, client.ServerConfig{ServerAddr: *a, ServerKey: serverkeys[n], ServerFaildTime: 0, ServerBanUntil: 0})
+				sconfig = append(sconfig, client.ServerConfig{ServerAddr: *a, ServerKey: serverkeys[n], ServerFaildTime: 0, ServerLastFailedTime: 0})
 			}
 		}
 		var ac client.AClient
