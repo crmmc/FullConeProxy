@@ -3,14 +3,10 @@ package mycrypto
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"time"
@@ -22,6 +18,7 @@ var isdebug bool = true
 var maxallowtimeerror int64 = 10 //最大允许收发数据包的两端时间相差10秒
 var timeiv int64 = -404          //时间戳的偏移量，防止被记录包发送时间后用密码解出包的内容，其实这一点应该随机生成更好
 var enablegzip bool = false      //是否开启压缩GZIP数据
+
 func SetDebug(mode bool) {
 	isdebug = mode
 }
@@ -38,10 +35,6 @@ func SetTimestmpDelay(delay int64) {
 
 func SetMaxAllowTimeError(settime int64) {
 	maxallowtimeerror = settime
-}
-
-func Strtokey128(str string) ([]byte, error) {
-	return hex.DecodeString(fmt.Sprintf("%x", md5.Sum([]byte(str))))
 }
 
 func Strtokey256(str string) ([]byte, error) {
@@ -74,7 +67,7 @@ func Makenonce() ([]byte, error) {
 //但是与错误的版本和密码导致的数据解密失败分不开，这该如何是好，还是保持原来的反应吧
 
 //用于接收私有协议加密数据的函数
-func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte, error) {
+func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte, aesadad cipher.AEAD) ([]byte, error) {
 	var numsizebyte []byte
 	var err error
 	numsizebyte, err = pubpro.ReadbytesFrom(sconn, 4)
@@ -95,7 +88,7 @@ func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte,
 		var ddata []byte
 		for tmpsize := maxallowtimeerror * int64(-1); tmpsize < maxallowtimeerror; tmpsize++ {
 			iv = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(datasize+tmpsize)...))
-			ddata, err = DecodeAesGCM(enddata, key, iv, adddata)
+			ddata, err = DecodeAesGCM(enddata, key, iv, adddata, aesadad)
 			if err == nil {
 				//去掉填充用的随机数据
 				if enablegzip {
@@ -107,7 +100,7 @@ func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte,
 			}
 		}
 	} else {
-		enddata, err = DecodeAesGCM(enddata, key, iv, adddata)
+		enddata, err = DecodeAesGCM(enddata, key, iv, adddata, aesadad)
 		if err == nil {
 			//去掉填充用的随机数据
 			if enablegzip {
@@ -122,7 +115,7 @@ func DecryptFrom(sconn net.Conn, key []byte, iv []byte, adddata []byte) ([]byte,
 }
 
 //用于发送私有协议加密数据的函数
-func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte) (int, error) {
+func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte, aesadad cipher.AEAD) (int, error) {
 	if len(iv) != 16 {
 		iv = pubpro.MD5toBytes(append(key, pubpro.Int64toBytes(time.Now().Unix()+timeiv)...))
 	}
@@ -162,7 +155,7 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte
 	}
 	var enddata []byte
 	data = append(append(randomdatasizebyte, randombyte...), data...)
-	enddata, err = EncodeAesGCM(data, key, iv, adddata)
+	enddata, err = EncodeAesGCM(data, key, iv, adddata, aesadad)
 	if err != nil {
 		return 0, err
 	}
@@ -172,30 +165,20 @@ func EncryptTo(data []byte, ento net.Conn, key []byte, iv []byte, adddata []byte
 }
 
 //AES GCM加密
-func EncodeAesGCM(data []byte, key []byte, iv []byte, adddata []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, errors.New("EncodeAesGCM 新建AES加密器失败" + err.Error())
-	}
-	aesgcm, err := cipher.NewGCMWithNonceSize(block, 16)
-	if err != nil {
-		return nil, errors.New("EncodeAesGCM 设置AES加密器IV Size失败" + err.Error())
+func EncodeAesGCM(data []byte, key []byte, iv []byte, adddata []byte, aesgcm cipher.AEAD) ([]byte, error) {
+	if aesgcm == nil {
+		return nil, errors.New("DecodeAesGCM 无法使用的AEAD解密器")
 	}
 	return aesgcm.Seal(nil, iv, data, adddata), nil //得到data
 }
 
-func DecodeAesGCM(enddata []byte, key []byte, iv []byte, adddata []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key) //生成加解密用的block
-	if err != nil {
-		return nil, errors.New("DecodeAesGCM 新建AES对象失败" + err.Error())
+func DecodeAesGCM(enddata []byte, key []byte, iv []byte, adddata []byte, aesgcm cipher.AEAD) ([]byte, error) {
+	if aesgcm == nil {
+		return nil, errors.New("DecodeAesGCM 无法使用的AEAD解密器")
 	}
-	//根据不同加密算法，也有不同tag长度的方法设定和调用，比如NewGCMWithTagSize、newGCMWithNonceAndTagSize
-	var aesgcm cipher.AEAD
-	aesgcm, err = cipher.NewGCMWithNonceSize(block, 16)
-	if err != nil {
-		return nil, err
-	}
+	var err error
 	var dedata []byte
+
 	dedata, err = aesgcm.Open(nil, iv, enddata, adddata)
 	if err != nil {
 		return nil, errors.New("DecodeAesGCM 解密AES数据出错! " + err.Error())

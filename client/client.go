@@ -1,6 +1,8 @@
 package client
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	crand "crypto/rand"
 	"errors"
 	"fmt"
@@ -42,12 +44,13 @@ type ServerConfig struct {
 //到时间，所有的连接都被设置到这个计时器，就会导致一个计时器到时间，立马让所有使用这个计时器的连接回报IO Timeout错误，导致程序废掉
 type AClient struct {
 	serverconfig       []ServerConfig
-	tcpReadTimeout     int  //TCP Read Timeout
-	tcpWriteTimeout    int  //TCP Write Timeout
-	udpLifeTime        int  //UDP的ReadWrite Timeout
-	tcpNODELAY         bool //TCP的无延迟发送选项
-	IsDebug            bool //是否处于调试模式
-	ServerChoiceRandom bool //是否随机取服务器，还是按顺序使用服务器，将靠后的服务器作为备份使用
+	tcpReadTimeout     int         //TCP Read Timeout
+	tcpWriteTimeout    int         //TCP Write Timeout
+	udpLifeTime        int         //UDP的ReadWrite Timeout
+	tcpNODELAY         bool        //TCP的无延迟发送选项
+	IsDebug            bool        //是否处于调试模式
+	ServerChoiceRandom bool        //是否随机取服务器，还是按顺序使用服务器，将靠后的服务器作为备份使用
+	clientcipher       cipher.AEAD //客户端的加解密器
 }
 
 func (r *AClient) Init() {
@@ -148,6 +151,18 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 	if r.IsDebug {
 		fmt.Printf("LOCAL 生成随机数 nonce: %x\n", nownonce)
 	}
+	//开始生成此会话使用的AEAD加密器
+	block, err := aes.NewCipher(key) //生成加解密用的block
+	if err != nil {
+		log.Println("Client Process 新建AES对象失败" + err.Error())
+		return false
+	}
+	//根据不同加密算法，也有不同tag长度的方法设定和调用，比如NewGCMWithTagSize、newGCMWithNonceAndTagSize
+	r.clientcipher, err = cipher.NewGCMWithNonceSize(block, 16)
+	if err != nil {
+		log.Println("Client Process 设置AES对象失败" + err.Error())
+		return false
+	}
 	/**
 		处理数据包成这个样子发往服务器
 	+---------------+--------------+--------------+----------+----------+
@@ -169,7 +184,7 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		socks5conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		//发送首包到服务器
 		//客户端发过去的包的adddata都是 0XFF,0XFF
-		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), buf[3:n]...), serverconn, key, nil, []byte{0xff, 0xff})
+		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), buf[3:n]...), serverconn, key, nil, []byte{0xff, 0xff}, r.clientcipher)
 		if err != nil {
 			log.Println("LOCAL 发送TCP指令到SERVER失败！ , ", err.Error())
 			return false
@@ -229,7 +244,7 @@ func (r *AClient) process(socks5conn *net.TCPConn) bool {
 		if err != nil {
 			log.Println("LOCAL 随机数生成失败，无法发送UDP指令到SERVER ", err.Error())
 		}
-		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), tmpdata...), serverconn, key, nil, []byte{0xff, 0xff})
+		_, err = mycrypto.EncryptTo(append(append(nownonce, buf[1:2]...), tmpdata...), serverconn, key, nil, []byte{0xff, 0xff}, r.clientcipher)
 		if err != nil {
 			log.Println("LOCAL 发送TCP指令到SERVER失败！ , ", err.Error())
 			return false
@@ -311,7 +326,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		for {
 			//从服务器接收到的数据包都是打包好的UDP数据包，到这里加上UDP头部的三字节
 			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
-			data, receerr = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff})
+			data, receerr = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff}, r.clientcipher)
 			if receerr != nil {
 				if r.IsDebug && receerr != io.EOF && !strings.Contains(receerr.Error(), "closed") {
 					log.Println("LOCAL 从服务器接收返回数据失败！ , ", receerr.Error())
@@ -381,7 +396,7 @@ func (r *AClient) processudp(socks5conn *net.TCPConn, udpconn *net.UDPConn, udpr
 		}
 		serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
 		//要去掉头部的三字节0,和服务器那边对应
-		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce, []byte{0xff, 0xff})
+		_, err = mycrypto.EncryptTo(buf[3:rdn], serverconn, *key, *nownonce, []byte{0xff, 0xff}, r.clientcipher)
 		if err != nil {
 			if r.IsDebug && err != io.EOF && !strings.Contains(err.Error(), "reset") {
 				log.Println("SOCKS5 UDP打包数据加密失败,关闭连接 , ", err.Error())
@@ -416,7 +431,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 		var tmpwrite int
 		for {
 			serverconn.SetReadDeadline(time.Now().Add(time.Duration(r.tcpReadTimeout) * time.Second))
-			fromserverdata, err2 = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff})
+			fromserverdata, err2 = mycrypto.DecryptFrom(serverconn, *key, *nownonce, []byte{0xfc, 0xff}, r.clientcipher)
 			if err2 != nil {
 				if r.IsDebug && err2 != io.EOF && !strings.Contains(err2.Error(), "closed") {
 					log.Println("Local: 解密来自SERVER的数据失败 , ", err2.Error())
@@ -453,7 +468,7 @@ func (r *AClient) processtcp(socks5conn *net.TCPConn, serverconn *net.TCPConn, k
 		} else {
 			//fmt.Printf("LOCAL 发送数据：|%x|->|%d|\n", buf[:ln], ln)
 			serverconn.SetWriteDeadline(time.Now().Add(time.Duration(r.tcpWriteTimeout) * time.Second))
-			_, err = mycrypto.EncryptTo(buf[:ln], serverconn, *key, *nownonce, []byte{0xff, 0xff})
+			_, err = mycrypto.EncryptTo(buf[:ln], serverconn, *key, *nownonce, []byte{0xff, 0xff}, r.clientcipher)
 			if err != nil {
 				if r.IsDebug {
 					log.Println("LOCAL: TCP数据发送到SERVER失败! , ", err.Error())

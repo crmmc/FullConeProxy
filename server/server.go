@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"fmt"
 	"io"
 	"log"
@@ -170,10 +172,11 @@ type processer struct {
 	keybyte         *[]byte
 	nonce           []byte
 	Isdebug         *bool
-	TcpReadTimeout  *int  //TCP Read Timeout
-	TcpWriteTimeout *int  //TCP Write Timeout
-	UdpLifeTime     *int  //UDP的ReadWrite Timeout
-	TcpNODELAY      *bool //TCP的无延迟发送选项
+	TcpReadTimeout  *int        //TCP Read Timeout
+	TcpWriteTimeout *int        //TCP Write Timeout
+	UdpLifeTime     *int        //UDP的ReadWrite Timeout
+	TcpNODELAY      *bool       //TCP的无延迟发送选项
+	processcipher   cipher.AEAD //用于加解密的cipher
 
 }
 
@@ -195,13 +198,23 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	//此进程一般不会退出除非处理完成，所以传递指针
 	r.connfromclient = sconn.(*net.TCPConn)
 	r.keybyte = &key
+	block, err := aes.NewCipher(key) //生成加解密用的block
+	if err != nil {
+		log.Println("Server Process 新建AES对象失败" + err.Error())
+		return false
+	}
+	//根据不同加密算法，也有不同tag长度的方法设定和调用，比如NewGCMWithTagSize、newGCMWithNonceAndTagSize
+	r.processcipher, err = cipher.NewGCMWithNonceSize(block, 16)
+	if err != nil {
+		log.Println("Server Process 设置AES对象失败" + err.Error())
+		return false
+	}
 	//解密出来的完整首包数据
 	var dedata []byte
-	var err error
 	//在加密函数那里写了若是附加数据为nil，则自动给包加(时间戳与key)的MD5作为附加数据，这样的话首包的安全性能得到更大保障
 	//解包使用类似V2的做法，可以允许LOCAL与SERVER时间相差正负两秒,若是nownonce为nil，则自动使用(当前正负两秒共计四个时间戳分别与key)的MD5作为附加数据验证，这样允许客户端与服务端有时间误差，消耗性能换安全性
 	r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
-	dedata, err = mycrypto.DecryptFrom(r.connfromclient, key, nil, []byte{0xff, 0xff})
+	dedata, err = mycrypto.DecryptFrom(r.connfromclient, key, nil, []byte{0xff, 0xff}, r.processcipher)
 	if err != nil {
 		log.Printf("SERVER: 握手失败 [%s]--x->[SERVER] ERROR:[%s]\n", r.connfromclient.RemoteAddr().String(), err.Error())
 		return false
@@ -296,7 +309,7 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 		var err error
 		for {
 			r.connfromclient.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
-			dedata, err = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce, []byte{0xff, 0xff})
+			dedata, err = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce, []byte{0xff, 0xff}, r.processcipher)
 			if err != nil {
 				if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset") {
 					log.Println("SERVER: 从LOCAL读数据错误！, ", err.Error())
@@ -335,7 +348,7 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 			targettoserver = targettoserver + ln
 			//每次写前更新一下写超时的判定时间点
 			r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
-			_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff})
+			_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff}, r.processcipher)
 			if err != nil {
 				if *r.Isdebug {
 					log.Printf("SERVER 返回来自TARGET的TCP数据失败！ %s\n", err.Error())
@@ -402,7 +415,7 @@ func (r *processer) processudp() bool {
 			//更新一下写超时的判定时间点
 			r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
 			//通过命令连接送回UDP数据包
-			_, err2 := mycrypto.EncryptTo(append(writebuf, buf[:rcn]...), r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff})
+			_, err2 := mycrypto.EncryptTo(append(writebuf, buf[:rcn]...), r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff}, r.processcipher)
 			if err2 != nil {
 				log.Println("SERVER 转发已接收到的UDP数据错误！ , ", err2.Error())
 				break
@@ -420,7 +433,7 @@ func (r *processer) processudp() bool {
 	var servertotargetudp int
 	for {
 		r.connfromclient.SetReadDeadline(time.Now().Add(time.Second * time.Duration(*r.TcpReadTimeout)))
-		fromlocaldata, err1 = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce, []byte{0xff, 0xff})
+		fromlocaldata, err1 = mycrypto.DecryptFrom(r.connfromclient, *r.keybyte, r.nonce, []byte{0xff, 0xff}, r.processcipher)
 		if err1 != nil {
 			if *r.Isdebug {
 				log.Println("SERVER UoT隧道读数据失败 , ", err1.Error())

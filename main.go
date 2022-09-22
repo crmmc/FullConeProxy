@@ -15,7 +15,7 @@ import (
 )
 
 //手写版本号
-var version string = "v1.3.3 Bate"
+var version string = "v1.3.4 Stable"
 
 //给密码生成加个salt,要修改不要改这里不生效，往下面改MAIN函数里的
 var keysalt string = "TooSlot"
@@ -32,7 +32,6 @@ func main() {
 	ondebug := flag.Bool("debug", false, "ON DEBUG MODE")
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
 	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
-	loweraes := flag.Bool("lower", false, "Use lower security encryption methods(AES-128-GCM) instead of AES-256-GCM , This option will affect the encryption of all passwords. When using multiple servers, please note that the password encryption mode used by each server cannot be customized")
 	ongzip := flag.Bool("gzip", false, "Enable gzip compress for saving flows")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
@@ -65,7 +64,7 @@ func main() {
 			return
 		}
 		var serverkeys [][]byte
-		serverkeys, err = getkeybyte(*stringkey, *loweraes)
+		serverkeys, err = getkeybyte(*stringkey)
 		if err != nil {
 			return
 		}
@@ -98,7 +97,7 @@ func main() {
 	as.SetDebug(*ondebug)
 	as.SetTCPReadTimeout(*tcptimeout)
 	as.SetUDPLifeTime(*udptimeout)
-	astmp1, err := getkeybyte(*stringkey, *loweraes)
+	astmp1, err := getkeybyte(*stringkey)
 	if err != nil {
 		return
 	}
@@ -109,27 +108,18 @@ func main() {
 	as.StartLoop()
 }
 
-func getkeybyte(keys string, loweraes bool) ([][]byte, error) {
+func getkeybyte(keys string) ([][]byte, error) {
 	serverkeys := strings.Split(keys, ",")
 	returnkeys := make([][]byte, len(serverkeys))
 	var err error
 	var tmpkey []byte
 	for n, gkt := range serverkeys {
-		if loweraes {
-			tmpkey, err = mycrypto.Strtokey128(gkt + keysalt) //生成密钥
-			if err != nil {
-				log.Println("无法生成AES-128-GCM秘钥！ ", err.Error())
-				return returnkeys, err
-			}
-			returnkeys[n] = tmpkey
-		} else {
-			tmpkey, err = mycrypto.Strtokey256(gkt + keysalt) //生成密钥
-			if err != nil {
-				log.Println("无法生成AES-256-GCM秘钥！ ", err.Error())
-				return returnkeys, err
-			}
-			returnkeys[n] = tmpkey
+		tmpkey, err = mycrypto.Strtokey256(gkt + keysalt) //生成密钥
+		if err != nil {
+			log.Println("无法生成AES-256-GCM秘钥！ ", err.Error())
+			return returnkeys, err
 		}
+		returnkeys[n] = tmpkey
 	}
 	return returnkeys, nil
 }
