@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -136,6 +139,88 @@ func (r *AServer) StartServer(locallisten string, key []byte) error {
 	return nil
 }
 
+func (r *AServer) FakeTlsLoop(FTCPURL string) error {
+	fmt.Println("启用FakeTLS模式的Server监听开始,", "FakeTLS连接的目标服务器为:", FTCPURL)
+	defer r.Close()
+	for {
+		connfromclient, err := r.listener.Accept()
+		if err != nil {
+			log.Printf("SERVER %s 在接受连接时出现错误! %s\n", r.listener.Addr().String(), err.Error())
+			return err
+		}
+		connfromclient.(*net.TCPConn).SetLinger(0)
+		connfromclient.(*net.TCPConn).SetNoDelay(r.tcpNODELAY)
+		var pc1 processer
+		//此处的变量一直不会改变值，所以传递指针
+		pc1.Isdebug = &r.Isdebug
+		pc1.TcpReadTimeout = &r.tcpReadTimeout
+		pc1.TcpWriteTimeout = &r.tcpWriteTimeout
+		pc1.UdpLifeTime = &r.udpLifeTime
+		//服务器连接到目标这一段网络的质量通常认为是很好的，所以不需要开启这个选项
+		pc1.TcpNODELAY = &r.tcpNODELAY
+		if r.Isdebug {
+			fmt.Println("Server FakeTLS 开始连接到服务器")
+		}
+		toweb, err := net.DialTimeout("tcp", FTCPURL+":443", 2*time.Second)
+		if err != nil {
+			if r.Isdebug {
+				log.Println("Server FakeTLS连接到服务器失败 ", err)
+			}
+			toweb.Close()
+			connfromclient.Close()
+			continue
+		}
+		if r.Isdebug {
+			fmt.Println("Server FakeTLS等待TLS握手过程完成")
+		}
+		go io.Copy(connfromclient, toweb)
+		ab := r.TLScopyUntilHandshakeFinished(toweb, connfromclient)
+		if ab != nil {
+			if r.Isdebug {
+				log.Println("Server FakeTLS接收握手失败 ", ab.Error())
+			}
+			toweb.Close()
+			connfromclient.Close()
+			continue
+		}
+		go pc1.Process(connfromclient, r.keybyte, toweb)
+	}
+}
+
+func (r *AServer) TLScopyUntilHandshakeFinished(dst net.Conn, src net.Conn) error {
+	const handshake = 0x16
+	const changeCipherSpec = 0x14
+	const cfCipherSpec = 0x17
+	var hasSeenChangeCipherSpec bool
+	var tlsHdr [5]byte
+	for {
+		_, err := io.ReadFull(src, tlsHdr[:])
+		if err != nil {
+			return err
+		}
+		length := binary.BigEndian.Uint16(tlsHdr[3:])
+		_, err = io.Copy(dst, io.MultiReader(bytes.NewReader(tlsHdr[:]), io.LimitReader(src, int64(length))))
+		if err != nil {
+			return err
+		}
+
+		if tlsHdr[0] != handshake {
+			if tlsHdr[0] != changeCipherSpec && tlsHdr[0] != cfCipherSpec {
+				dst.Close()
+				src.Close()
+				return errors.New("unexpected tls frame type: " + fmt.Sprintf("0x%x", tlsHdr[0]))
+			}
+			if !hasSeenChangeCipherSpec {
+				hasSeenChangeCipherSpec = true
+				continue
+			}
+		}
+		if hasSeenChangeCipherSpec {
+			return nil
+		}
+	}
+}
+
 func (r *AServer) Close() {
 	if r.listener != nil {
 		r.listener.Close()
@@ -161,7 +246,7 @@ func (r *AServer) StartLoop() error {
 		pc1.UdpLifeTime = &r.udpLifeTime
 		//服务器连接到目标这一段网络的质量通常认为是很好的，所以不需要开启这个选项
 		pc1.TcpNODELAY = &r.tcpNODELAY
-		go pc1.Process(connfromclient, r.keybyte)
+		go pc1.Process(connfromclient, r.keybyte, nil)
 	}
 }
 
@@ -193,7 +278,7 @@ func (r *processer) Close() {
 }
 
 //处理并分发请求
-func (r *processer) Process(sconn net.Conn, key []byte) bool {
+func (r *processer) Process(sconn net.Conn, key []byte, tlsconn net.Conn) bool {
 	defer r.Close()
 	//此进程一般不会退出除非处理完成，所以传递指针
 	r.connfromclient = sconn.(*net.TCPConn)
@@ -218,6 +303,10 @@ func (r *processer) Process(sconn net.Conn, key []byte) bool {
 	if err != nil {
 		log.Printf("SERVER: 握手失败 [%s]--x->[SERVER] ERROR:[%s]\n", r.connfromclient.RemoteAddr().String(), err.Error())
 		return false
+	}
+	//可以关闭TLS连接啦
+	if tlsconn != nil {
+		tlsconn.Close()
 	}
 	//首包数据长度
 	n := len(dedata)
@@ -339,23 +428,24 @@ func (r *processer) procrsstcp(raddr *net.TCPAddr) bool {
 	for {
 		//每次读操作前更新一下读超时的时间点
 		r.tcptotarget.SetReadDeadline(time.Now().Add(time.Duration(*r.TcpReadTimeout) * time.Second))
-		if ln, err = r.tcptotarget.Read(buf); err != nil {
-			if *r.Isdebug && err != io.EOF && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset") {
-				log.Println("SERVER 从TARGET读数据错误！, ", err.Error())
+		ln, err = r.tcptotarget.Read(buf)
+		if *r.Isdebug && err != nil && !strings.Contains(err.Error(), "closed") && !strings.Contains(err.Error(), "reset") && err != io.EOF {
+			log.Println("SERVER 从TARGET读数据错误！, ", err.Error())
+		}
+		if ln < 1 {
+			break
+		}
+		targettoserver = targettoserver + ln
+		//每次写前更新一下写超时的判定时间点
+		r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
+		_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff}, r.processcipher)
+		if err != nil {
+			if *r.Isdebug {
+				log.Printf("SERVER 返回来自TARGET的TCP数据失败！ %s\n", err.Error())
 			}
 			break
-		} else {
-			targettoserver = targettoserver + ln
-			//每次写前更新一下写超时的判定时间点
-			r.connfromclient.SetWriteDeadline(time.Now().Add(time.Duration(*r.TcpWriteTimeout) * time.Second))
-			_, err = mycrypto.EncryptTo(buf[:ln], r.connfromclient, *r.keybyte, r.nonce, []byte{0xfc, 0xff}, r.processcipher)
-			if err != nil {
-				if *r.Isdebug {
-					log.Printf("SERVER 返回来自TARGET的TCP数据失败！ %s\n", err.Error())
-				}
-				break
-			}
 		}
+
 	}
 	//防止后面close后这个变量消失，这里新建一个变量存着Target的地址数据
 	TCPTOaddr := r.tcptotarget.RemoteAddr().String()

@@ -15,7 +15,7 @@ import (
 )
 
 //手写版本号
-var version string = "v1.3.4 Stable"
+var version string = "v1.3.5 Bate"
 
 //给密码生成加个salt,要修改不要改这里不生效，往下面改MAIN函数里的
 var keysalt string = "TooSlot"
@@ -33,6 +33,8 @@ func main() {
 	ontest := flag.Bool("test", false, "ON TEST MODE, WILL RUN SERVER AND CLIENT ON ONE MACHINE")
 	serverchoicemode := flag.Bool("norandom", false, "In default ,When uding more than one server,use random method to choice server for each connection. Otherwise, only when the front server fails, the back server will be used as a backup")
 	ongzip := flag.Bool("gzip", false, "Enable gzip compress for saving flows")
+	faketls := flag.Bool("faketls", false, "use normal tls handshake to camouflage connection")
+	faketlsserver := flag.String("ftlssev", "www.cloudflare.com", "set faketls server,in server mode is set forward server, in client mode is set TLS SNI")
 	showhelp := flag.Bool("h", false, "SHOW HELP")
 	flag.Parse()
 	if *showhelp {
@@ -50,8 +52,8 @@ func main() {
 		f.Close()
 	}
 	//在这里DIY你的独特配置
-	mycrypto.SetTimestmpDelay(-111)
-	keysalt = "Ak"
+	mycrypto.SetTimestmpDelay(-941)
+	keysalt = "AHFJ"
 	//DIY你的独特配置
 	mycrypto.SetDebug(*ondebug)
 	mycrypto.SetEnableGzip(*ongzip)
@@ -84,6 +86,8 @@ func main() {
 		ac.SetDebug(*ondebug)
 		ac.SetTCPReadTimeout(*tcptimeout)
 		ac.SetUDPLifeTime(*udptimeout)
+		ac.FakeTLS = *faketls
+		ac.FakeTLSSNI = *faketlsserver
 		ac.ServerChoiceRandom = !*serverchoicemode
 		if *ontest {
 			go ac.StartSocks5(*socks5listen, sconfig)
@@ -105,7 +109,11 @@ func main() {
 	if err != nil {
 		return
 	}
-	as.StartLoop()
+	if *faketls {
+		as.FakeTlsLoop(*faketlsserver)
+	} else {
+		as.StartLoop()
+	}
 }
 
 func getkeybyte(keys string) ([][]byte, error) {

@@ -1,9 +1,11 @@
 package client
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	crand "crypto/rand"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -51,6 +53,8 @@ type AClient struct {
 	IsDebug            bool        //是否处于调试模式
 	ServerChoiceRandom bool        //是否随机取服务器，还是按顺序使用服务器，将靠后的服务器作为备份使用
 	clientcipher       cipher.AEAD //客户端的加解密器
+	FakeTLS            bool        //启用FakeTLS
+	FakeTLSSNI         string      //FakeURL的服务器地址
 }
 
 func (r *AClient) Init() {
@@ -79,6 +83,9 @@ func (r *AClient) StartSocks5(socks5listenaddr string, serverconfig []ServerConf
 		return
 	}
 	defer socks5listener.Close()
+	if r.FakeTLS {
+		fmt.Println("Client 启用FakeTLS模式,伪装的SNI为:", r.FakeTLSSNI)
+	}
 	for _, i := range serverconfig {
 		fmt.Printf("Client使用服务器地址: [%s]", i.ServerAddr.String())
 		if r.IsDebug {
@@ -272,20 +279,44 @@ func (r *AClient) ConnectToAServer() (*net.TCPConn, []byte, error) {
 		})
 	}
 	for surint := range r.serverconfig {
-		//若最后一次失败的时间到现在超过30秒里，那就解放服务器，重置失败次数
-		if r.serverconfig[surint].ServerLastFailedTime-time.Now().Unix() > 30 {
+		//若最后一次失败的时间到现在超过5秒里，那就解放服务器，重置失败次数
+		if r.serverconfig[surint].ServerLastFailedTime-time.Now().Unix() > 5 {
 			r.serverconfig[surint].ServerFaildTime = 0
 			log.Printf("Local: --X->[%s][SERVER] Server Release\n", r.serverconfig[surint].ServerAddr.IP)
 		}
 		//30秒内失败3次就算寄
 		if r.serverconfig[surint].ServerFaildTime > 2 {
-			log.Printf("Local: --X->[%s][SERVER] Server Connect Failed Too Many Time, Disable it for 30 second!\n", r.serverconfig[surint].ServerAddr.IP)
+			log.Printf("Local: --X->[%s][SERVER] Server Connect Failed Too Many Time, Disable it for 5 second!\n", r.serverconfig[surint].ServerAddr.IP)
 			continue
 		}
-		//连接服务器的超时保持,2秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
-		a, err = net.DialTimeout("tcp", r.serverconfig[surint].ServerAddr.String(), time.Duration(2)*time.Second)
-		if err == nil {
-			return a.(*net.TCPConn), r.serverconfig[surint].ServerKey, err
+		if r.FakeTLS {
+			a, err = net.DialTimeout("tcp", r.serverconfig[surint].ServerAddr.String(), time.Duration(2)*time.Second)
+			if err == nil {
+				if r.FakeTLS {
+					if r.IsDebug {
+						fmt.Println("Client FakeTLS握手开始")
+					}
+					b := tls.Client(a, &tls.Config{InsecureSkipVerify: true, ServerName: r.FakeTLSSNI})
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer cancel()
+					tlserr := b.HandshakeContext(ctx)
+					if tlserr == nil {
+						if r.IsDebug {
+							fmt.Println("Client FakeTLS握手过程结束")
+						}
+						return a.(*net.TCPConn), r.serverconfig[surint].ServerKey, err
+					} else {
+						log.Println("Client FakeTLS握手过程失败")
+					}
+				}
+			}
+
+		} else {
+			//连接服务器的超时保持,2秒建立一个TCP连接很困难吗？ 太久会拖累备用服务器的切换体验
+			a, err = net.DialTimeout("tcp", r.serverconfig[surint].ServerAddr.String(), time.Duration(2)*time.Second)
+			if err == nil {
+				return a.(*net.TCPConn), r.serverconfig[surint].ServerKey, err
+			}
 		}
 		//连接服务器失败算一个重要的信息，不能忽略
 		log.Printf("Local: --X->[%s][SERVER] Server Connect Failed! Times:%d\n", r.serverconfig[surint].ServerAddr.IP, r.serverconfig[surint].ServerFaildTime)
