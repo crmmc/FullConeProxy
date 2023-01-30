@@ -15,7 +15,7 @@ import (
 )
 
 //手写版本号
-var version string = "v1.3.5 Bate"
+var version string = "v1.3.7 Bate"
 
 //给密码生成加个salt,要修改不要改这里不生效，往下面改MAIN函数里的
 var keysalt string = "TooSlot"

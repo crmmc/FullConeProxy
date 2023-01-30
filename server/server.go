@@ -159,22 +159,11 @@ func (r *AServer) FakeTlsLoop(FTCPURL string) error {
 		//服务器连接到目标这一段网络的质量通常认为是很好的，所以不需要开启这个选项
 		pc1.TcpNODELAY = &r.tcpNODELAY
 		if r.Isdebug {
-			fmt.Println("Server FakeTLS 开始连接到服务器")
+			fmt.Println("Server FakeTLS 开始连接到服务器 -> ", FTCPURL+":443")
 		}
-		toweb, err := net.DialTimeout("tcp", FTCPURL+":443", 2*time.Second)
-		if err != nil {
-			if r.Isdebug {
-				log.Println("Server FakeTLS连接到服务器失败 ", err)
-			}
-			toweb.Close()
-			connfromclient.Close()
-			continue
-		}
-		if r.Isdebug {
-			fmt.Println("Server FakeTLS等待TLS握手过程完成")
-		}
-		go io.Copy(connfromclient, toweb)
-		ab := r.TLScopyUntilHandshakeFinished(toweb, connfromclient)
+		var toweb net.Conn                      //初始化一下toweb
+		closecopychan := make(chan struct{}, 1) //这个控制client单工通道的开关
+		ab := r.TLScopyUntilHandshakeFinished(toweb, connfromclient, FTCPURL+":443", &closecopychan)
 		if ab != nil {
 			if r.Isdebug {
 				log.Println("Server FakeTLS接收握手失败 ", ab.Error())
@@ -183,28 +172,33 @@ func (r *AServer) FakeTlsLoop(FTCPURL string) error {
 			connfromclient.Close()
 			continue
 		}
+
+		closecopychan <- struct{}{}
+		toweb.SetDeadline(time.Now().Add(3 * time.Second))
 		go pc1.Process(connfromclient, r.keybyte, toweb)
 	}
 }
 
-func (r *AServer) TLScopyUntilHandshakeFinished(dst net.Conn, src net.Conn) error {
+//这里防止被DDOS，一旦找我的端口尝试建立连接，我就直接发起对FAKE SNI服务器的连接，会导致可能的DDOS帮凶，所以要先验证他的首包是不是TLS的Client Hellow
+
+func (r *AServer) TLScopyUntilHandshakeFinished(dst net.Conn, src net.Conn, FakeTLSSever string, closecopychan *chan struct{}) error {
 	const handshake = 0x16
 	const changeCipherSpec = 0x14
 	const cfCipherSpec = 0x17
 	var hasSeenChangeCipherSpec bool
 	var tlsHdr [5]byte
+	var isFirst bool = true
 	for {
 		_, err := io.ReadFull(src, tlsHdr[:])
 		if err != nil {
 			return err
 		}
 		length := binary.BigEndian.Uint16(tlsHdr[3:])
-		_, err = io.Copy(dst, io.MultiReader(bytes.NewReader(tlsHdr[:]), io.LimitReader(src, int64(length))))
-		if err != nil {
-			return err
-		}
-
 		if tlsHdr[0] != handshake {
+			if isFirst {
+				src.Close()
+				return errors.New(`not a TLS Handshake Frame close the connection`)
+			}
 			if tlsHdr[0] != changeCipherSpec && tlsHdr[0] != cfCipherSpec {
 				dst.Close()
 				src.Close()
@@ -213,6 +207,38 @@ func (r *AServer) TLScopyUntilHandshakeFinished(dst net.Conn, src net.Conn) erro
 			if !hasSeenChangeCipherSpec {
 				hasSeenChangeCipherSpec = true
 				continue
+			}
+		} else {
+			isFirst = false
+			dst, err = net.DialTimeout("tcp", FakeTLSSever, 2*time.Second)
+			if err != nil {
+				if r.Isdebug {
+					log.Println("Server FakeTLS连接到服务器失败 ", err.Error())
+				}
+				dst.Close()
+				continue
+			}
+			if r.Isdebug {
+				fmt.Println("Server FakeTLS等待TLS握手过程完成")
+			}
+
+			go func() {
+				for {
+					select {
+					case <-*closecopychan:
+						return
+					default:
+						_, err := io.Copy(src, dst)
+						if err != nil {
+							return
+						}
+					}
+
+				}
+			}()
+			_, err = io.Copy(dst, io.MultiReader(bytes.NewReader(tlsHdr[:]), io.LimitReader(src, int64(length))))
+			if err != nil {
+				return err
 			}
 		}
 		if hasSeenChangeCipherSpec {
